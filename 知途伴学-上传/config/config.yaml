@@ -1,0 +1,17 @@
+# 知途伴学配置（三级合并：config.yaml < 环境变量 < 运行时覆盖）
+llm:
+  provider: mock            # mock（离线默认）| maas（讯飞星辰 MaaS，Key 放 .env）
+  base_url: "https://maas-api.cn-huabei-1.xf-yun.com/v2"   # 讯飞星辰 MaaS 推理服务（OpenAI 兼容）
+  api_key: ""               # 环境变量 LLM_API_KEY 可覆盖
+  model: "spark-x2.5-4b"    # 讯飞星辰 MaaS 模型 ID（用户已开通，2026-09-13 验证通过）
+  temperature: 0.7
+  max_tokens: 2048          # 必须显式设上限：spark-x2.5-4b 是推理模型，不设会先
+                            # 输出几千 token 思维链导致单次调用几十秒/超时，登录卡死
+
+paths:
+  kg: data/kg/ml_kg.json
+  questions: data/kg/questions.json
+  db: data/zhitu.db
+
+database:
+  wal: true

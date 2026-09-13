@@ -1,0 +1,32 @@
+gen_C nodes: 14
+e01 segs=5 ask=2 content_paras=3
+e02 segs=5 ask=2 content_paras=3
+e03 segs=5 ask=2 content_paras=3
+e04 segs=5 ask=2 content_paras=3
+e05 segs=5 ask=2 content_paras=3
+v01 segs=5 ask=2 content_paras=3
+v02 segs=5 ask=2 content_paras=3
+v03 segs=5 ask=2 content_paras=3
+v04 segs=5 ask=2 content_paras=3
+v05 segs=5 ask=2 content_paras=3
+v06 segs=5 ask=2 content_paras=3
+u01 segs=5 ask=2 content_paras=3
+u02 segs=5 ask=2 content_paras=3
+u03 segs=5 ask=2 content_paras=3
+gen_q questions: 42
+  e01: 3
+  e02: 3
+  e03: 3
+  e04: 3
+  e05: 3
+  u01: 3
+  u02: 3
+  u03: 3
+  v01: 3
+  v02: 3
+  v03: 3
+  v04: 3
+  v05: 3
+  v06: 3
+
+ALL CHECKS PASSED
