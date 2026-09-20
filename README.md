@@ -1,136 +1,3 @@
-
-# 知途伴学 · 本地 API Key（此文件已加入 .gitignore，不会随作品提交）
-LLM_API_KEY=ak-6235321da7716f2c73cca42a18b4ac70
-
-# Python 缓存
-__pycache__/
-*.pyc
-*.pyo
-
-# 本地数据库（含账号密码哈希与学习记录，绝不上传）
-data/zhitu.db
-data/zhitu.db-wal
-data/zhitu.db-shm
-
-# API Key 等敏感配置
-.env
-.streamlit/secrets.toml
-
-# 与本项目无关的文件（其他项目的参考资料）
-智医慧眼-商业计划书 (1).pdf
-.ref_text.txt
-
-# 本机专属配置
-.claude/settings.local.json
-
-"""知途伴学 · Streamlit 入口（登录页 → 核心界面五页导航）
-
-未登录只渲染登录页；登录后进入核心界面：对话学习 / 学生画像 / 学习路径 /
-知识图谱 / 状态探针。无任何 API Key 时 MockLLM 离线兜底，配置真实 Key 后
-自动切换真实大模型。
-"""
-import sys
-from pathlib import Path
-
-import streamlit as st
-
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT))
-
-from src.agent.state import AgentState  # noqa: E402
-from src.ui.env import build_env  # noqa: E402
-from src.ui.pages.account_page import account_page  # noqa: E402
-from src.ui.pages.chat_page import chat_page  # noqa: E402
-from src.ui.pages.home_page import home_page  # noqa: E402
-from src.ui.pages.kg_page import kg_page  # noqa: E402
-from src.ui.pages.login_page import login_page  # noqa: E402
-from src.ui.pages.path_page import path_page  # noqa: E402
-from src.ui.pages.profile_page import profile_page  # noqa: E402
-from src.ui.probe_page import probe_page  # noqa: E402
-
-st.set_page_config(page_title="知途伴学",
-                   page_icon=str(ROOT / "assets" / "logo.png"), layout="wide")
-
-from src.ui.theme import inject_theme, logo_html  # noqa: E402
-
-inject_theme()
-
-
-@st.cache_resource
-def get_env():
-    return build_env()
-
-
-env = get_env()
-st.session_state["env"] = env
-if "agent_state" not in st.session_state:
-    st.session_state["agent_state"] = None
-
-# ---------- 登录门禁：未登录只显示登录页 ----------
-if st.session_state["agent_state"] is None:
-    login_page(env)
-    st.stop()
-
-state = st.session_state["agent_state"]
-
-
-def _top_bar(current):
-    """页面顶栏：左侧返回首页（首页不显示），右上角账户入口"""
-    left, right = st.columns([5, 1.4], vertical_alignment="center")
-    with left:
-        if current.title != "首页":
-            st.markdown('<div class="back-home-bar">', unsafe_allow_html=True)
-            if st.button("← 返回首页", key="back_home"):
-                st.switch_page(st.Page(home_page))
-            st.markdown('</div>', unsafe_allow_html=True)
-    with right:
-        with st.container(key="top_account"):
-            if st.button(f":material/account_circle: {state.student_id}",
-                         key="acct_entry", help="账户管理"):
-                st.switch_page(st.Page(account_page))
-
-
-# ---------- 侧边栏（登录后） ----------
-with st.sidebar:
-    st.markdown(f'<div style="padding:2px 0 6px 0;">{logo_html(150, "0 0 0 0")}</div>',
-                unsafe_allow_html=True)
-    st.divider()
-    st.markdown(f"**学生**：{state.student_id}")
-    if st.button("结束本次会话", use_container_width=True,
-                 disabled=state.phase == "reflecting"):
-        env["orch"].handle(state, "结束")
-        st.rerun()
-    if st.button("退出登录", use_container_width=True):
-        st.session_state["agent_state"] = None
-        st.session_state["login_pwd"] = ""  # 退出后清除密码框，避免残留
-        st.rerun()
-    st.divider()
-    llm_cfg = env["cfg"]["llm"]
-    mode = ("真实大模型：" + llm_cfg.get("model", "")) \
-        if llm_cfg.get("provider") != "mock" else "离线模式（未配置 Key）"
-    st.caption(mode)
-    st.caption(f"知识库：{len(env['kg'].nodes)} 节点 / {len(env['questions'])} 题")
-
-# ---------- 核心界面 ----------
-pages = [
-    st.Page(home_page, title="首页", default=True),
-    st.Page(chat_page, title="对话学习"),
-    st.Page(profile_page, title="学生画像"),
-    st.Page(path_page, title="学习路径"),
-    st.Page(kg_page, title="知识图谱"),
-    st.Page(account_page, title="账户管理"),
-    st.Page(probe_page, title="状态探针"),
-]
-current = st.navigation(pages)
-_top_bar(current)
-current.run()
-
-"""pytest 根配置：把项目根目录加入 sys.path，使 tests/ 可直接 import src.*"""
-import sys
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent))
-
 # 知途伴学 · 大模型驱动的自适应学习路径决策与伴学智能体
 
 > 中国国际大学生创新大赛（2026）产业命题赛道 · 命题九十六
@@ -188,12 +55,12 @@ src/agent/                编排器 + 状态机（感知→规划→行动→记
 src/student/              学生画像、掌握度模型、学情诊断
 src/path/                 ZPD 路径规划 + 节奏参数
 src/tutor/                L0~L3 脚手架干预 + 分段讲义教学
-src/memory/               SQLite 记忆库（7 表）+ 检索 + 反思
+src/memory/               SQLite 记忆库（8 表）+ 检索 + 反思
 src/llm/                  大模型抽象层（OpenAI 兼容 / MockLLM 离线兜底）
 src/kg/                   知识图谱模型与拓扑查询
 data/kg/                  50 节点知识图谱 + 150 题题库（每题含 L0~L3 hints）
 config/                   配置（yaml + 环境变量 + 运行时三级合并）
-tests/                    84 个 pytest 用例（全离线，覆盖模型层到 UI）
+tests/                    93 个 pytest 用例（全离线，覆盖模型层到 UI）
 scripts/                  数据构建校验 / CLI 端到端 / 演示脚本
 docs/                     商业计划书 / 技术方案文档 / 演示视频脚本
 ```
@@ -201,7 +68,7 @@ docs/                     商业计划书 / 技术方案文档 / 演示视频脚
 ## 测试
 
 ```bash
-pytest tests/          # 84 用例全离线：KG 校验、掌握度公式、路径规划、
+pytest tests/          # 93 用例全离线：KG 校验、掌握度公式、路径规划、
                        # 诊断、脚手架、记忆反思、8 幕端到端、UI 无头冒烟
 python scripts/e2e_cli.py   # 命令行完整走一遍"诊断→测验→路径→教学→干预"
 python scripts/test_real_llm.py  # 配置真实 Key 后跑回归（连通性/结构化输出/8 幕剧本）；
@@ -255,12 +122,3 @@ python scripts/prepare_assets.py
 
 `python scripts/screenshot_pages.py`（依赖 playwright，仅开发期工具）自动驱动
 Streamlit 走完 8 幕剧本并输出各页面 PNG 到 `docs/screenshots/`，供项目书插图使用。
-
-streamlit>=1.36
-plotly>=5.22
-networkx>=3.2
-jieba>=0.42
-pyyaml>=6.0
-openai>=1.30
-pytest>=8.0
-
