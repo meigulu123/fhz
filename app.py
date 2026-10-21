@@ -27,12 +27,12 @@ from src.ui.pages.login_page import login_page  # noqa: E402
 from src.ui.pages.path_page import path_page  # noqa: E402
 from src.ui.pages.profile_page import profile_page  # noqa: E402
 from src.ui.pages.wrongbook_page import wrongbook_page  # noqa: E402
-from src.ui.probe_page import probe_page  # noqa: E402
 
 st.set_page_config(page_title="知途伴学",
                    page_icon=str(ROOT / "assets" / "logo.png"), layout="wide",
                    initial_sidebar_state="expanded")
 
+from src.ui.components import logout, render_flash  # noqa: E402
 from src.ui.theme import avatar_html, inject_theme, logo_html  # noqa: E402
 
 inject_theme()
@@ -45,6 +45,11 @@ def get_env():
 
 env = get_env()
 st.session_state["env"] = env
+# 存储降级提示：SQLite 不可用时（沙箱磁盘只读等）不把报错栈丢给用户，
+# 顶部给一条人话提示，功能照常可用，只是本次记录不落库。
+if getattr(env["mem"], "degraded", False):
+    st.warning("⚠️ 本地学习记录存储暂时不可用，本次学习不会保存（不影响继续使用）。"
+               f"　原因：{getattr(env['mem'], 'degraded_reason', '')}")
 if "agent_state" not in st.session_state:
     st.session_state["agent_state"] = None
 
@@ -65,9 +70,10 @@ NAV = [
     ("个人画像", "person_search", profile_page),
     ("错题本", "edit_note", wrongbook_page),
 ]
+# 开发者内部自检页（状态探针）不再放进学生导航：它对普通学生没有意义，
+# 只会让人以为遇到了「调试界面」。需要时用 probe_page 单独挂载。
 SYS = [
     ("账户管理", "manage_accounts", account_page),
-    ("状态探针", "monitor_heart", probe_page),
 ]
 pages = [st.Page(home_page, title="首页", default=True)] + [
     st.Page(fn, title=title) for title, _, fn in NAV[1:] + SYS
@@ -87,9 +93,10 @@ st.session_state.setdefault("sidebar_open", True)
 _sb_open = st.session_state["sidebar_open"]
 
 with st.sidebar:
-    st.markdown(f'<div style="padding:4px 0 0 0;">{logo_html(150, "0 0 0 0")}</div>',
-                unsafe_allow_html=True)
-    st.markdown('<p class="side-appname">知途伴学</p>', unsafe_allow_html=True)
+    # 侧边栏品牌区：只放 logo（图片本身已含「知途伴学」字标），flex 容器保证居中
+    st.markdown('<div class="side-brand">'
+                f'{logo_html(150, "0 0 6px 0")}'
+                '</div>', unsafe_allow_html=True)
 
     # 用户信息卡：头像（用户上传，未上传显示占位图标）+ 学生名 + 状态
     with st.container(border=True, key="side_user"):
@@ -120,17 +127,12 @@ with st.sidebar:
         _nav_button(title, icon, fn, current.title == title, key=f"sys_{i}")
 
     st.divider()
-    if st.button("结束本次会话", use_container_width=True,
+    if st.button("结束本次会话", use_container_width=True, type="tertiary",
                  disabled=state.phase == "reflecting"):
         env["orch"].handle(state, "结束")
         st.rerun()
-    if st.button("退出登录", use_container_width=True):
-        st.session_state["agent_state"] = None
-        st.session_state["login_pwd"] = ""  # 退出后清除密码框，避免残留
-        # 清页面级残留：学生切换器等有 key 的组件会记住上一个账户的选择，
-        # 不清理会导致新账户登录后画像页仍显示上一个学生的数据
-        for k in ("profile_student", "profile_report_cache"):
-            st.session_state.pop(k, None)
+    if st.button("退出登录", use_container_width=True, type="tertiary"):
+        logout()
         st.rerun()
     llm_cfg = env["cfg"]["llm"]
     mode = ("真实大模型：" + llm_cfg.get("model", "")) \
@@ -141,7 +143,13 @@ with st.sidebar:
 # ---------- 侧边栏开关：每页顶部右对齐，登录后所有页面可用 ----------
 import time as _time
 
-_c1, _c2 = st.columns([5.8, 1], vertical_alignment="center")
+_c0, _c1, _c2 = st.columns([1.35, 4.45, 1], vertical_alignment="center")
+with _c0:
+    # 运行模式徽标：离线演示 / 真实大模型，一眼可见
+    _mode_txt = "离线演示模式" if env["cfg"]["llm"].get("provider") == "mock" \
+        else "真实大模型"
+    st.markdown(f'<span class="mode-badge"><span class="dot"></span>'
+                f'{_mode_txt}</span>', unsafe_allow_html=True)
 with _c2:
     if st.button("✕ 收起侧边栏" if _sb_open else "☰ 打开侧边栏",
                  key="sb_toggle", help="显示 / 隐藏左侧导航栏"):
@@ -159,10 +167,13 @@ if _sb_open:
     # 强制显示：在主区注入（晚于主题 CSS 与 Streamlit 默认折叠规则），
     # 显式清掉 transform/position，任何宽度下左栏都钉住
     st.markdown(
-        '<style>section[data-testid="stSidebar"]{display:flex !important;'
-        'transform:none !important;width:320px !important;min-width:320px !important;'
+        '<style>@media screen and (min-width:701px){'
+        'section[data-testid="stSidebar"]{display:flex !important;'
+        'transform:none !important;width:var(--sidebar-w) !important;'
+        'min-width:var(--sidebar-w) !important;'
         'position:relative !important;left:0 !important}'
-        '[data-testid="stMain"]{position:static !important;min-width:0 !important}</style>',
+        '[data-testid="stMain"]{position:static !important;min-width:0 !important}'
+        '}</style>',
         unsafe_allow_html=True)
 else:
     # 收起：display:none 在主区注入，晚于主题 CSS，同优先级时后者生效
@@ -171,3 +182,6 @@ else:
         unsafe_allow_html=True)
 
 current.run()
+
+# 一次性操作提示（st.toast）：跨页面跳转存活，在最外层统一弹出
+render_flash()

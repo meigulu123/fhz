@@ -98,9 +98,10 @@ python scripts/test_real_llm.py  # 配置真实 Key 后跑回归（连通性/结
 
 ## 文档
 
-- [docs/商业计划书.md](docs/商业计划书.md) — 项目书（背景→设计→实现→测试→商业→展望）
-- [docs/技术方案文档.md](docs/技术方案文档.md) — 六层架构 / 知识库构建 / 动态路径优化原理
-- [docs/演示视频脚本.md](docs/演示视频脚本.md) — 3-5 分钟分镜
+- [docs/book/](docs/book/) — 项目书正文（Markdown，按章节：需求背景→平台设计→系统实现→测试→商业与社会价值）
+- [docs/知途伴学_项目书.docx](docs/知途伴学_项目书.docx) — 排版版项目书
+- [docs/assets/figs/](docs/assets/figs/) — 架构图 / 流程图 / 用例图等插图
+- [docs/assets/shots/](docs/assets/shots/) — 8 幕剧本全流程界面截图
 
 ## 品牌素材
 
@@ -121,4 +122,4 @@ python scripts/prepare_assets.py
 ## 截图素材
 
 `python scripts/screenshot_pages.py`（依赖 playwright，仅开发期工具）自动驱动
-Streamlit 走完 8 幕剧本并输出各页面 PNG 到 `docs/screenshots/`，供项目书插图使用。
+Streamlit 走完 8 幕剧本并输出各页面 PNG 到 `docs/assets/shots/`，供项目书插图使用。

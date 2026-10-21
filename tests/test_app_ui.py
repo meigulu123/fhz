@@ -278,13 +278,19 @@ def test_llm_plan_ordering_fallback(page_env):
 
 
 def test_llm_plan_ordering_mock_offline(page_env):
-    """离线 Mock 模式：LLM 通道静默回退公式，路径与现状完全一致"""
+    """离线 Mock 模式：也走 plan_initial 路由，产出画像驱动的定序与个性化理由"""
     env, state = page_env
     orch = env["orch"]
     base = env["planner"].plan(state.profile, batch=5)
-    plan = orch._llm_order(state, base)  # env 的 llm 是 MockLLM，无 plan_initial 路由
-    assert plan["items"] == base["items"]
-    assert "engine" not in plan
+    plan = orch._llm_order(state, base)
+    assert plan["engine"] == "llm"
+    assert {it["node_id"] for it in plan["items"]} == \
+        {it["node_id"] for it in base["items"]}, "候选集合应保持一致"
+    assert plan.get("notes"), "应给出整体安排说明"
+    for it in plan["items"]:
+        assert it["reason"] and "掌握度" in it["reason"], "理由应结合学生自身数据"
+        for key in ("tier", "difficulty", "mastery", "score"):
+            assert key in it
 
 
 # ---------- 大模型驱动的画像生成与持续更新 ----------
