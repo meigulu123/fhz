@@ -3,7 +3,9 @@ import time
 
 import streamlit as st
 
-from src.ui.components import TIER_BADGES
+from src.ui.components import TIER_BADGES, flash
+from src.ui.pages.chat_page import chat_page
+from src.path.review import due_reviews
 
 
 def path_page():
@@ -11,7 +13,12 @@ def path_page():
     env = st.session_state["env"]
     state = st.session_state.get("agent_state")
     if state is None or state.profile is None:
-        st.info("请先登录并完成诊断，路径页将展示个性化学习计划。")
+        # 空状态统一为「一句话 + 一个行动按钮」，学生不用自己找入口
+        with st.container(border=True):
+            st.markdown("**还没有学习计划**")
+            st.caption("完成一次学情诊断，这里会自动生成因人而异的个性化学习路径。")
+            if st.button("去完成学情诊断 →", type="primary", key="path_go_chat"):
+                st.switch_page(st.Page(chat_page))
         return
     kg, orch, profile = env["kg"], env["orch"], state.profile
 
@@ -31,11 +38,30 @@ def path_page():
         if state.plan.get("engine") == "llm":
             st.caption("排序引擎：AI 大模型结合学情定序")
         else:
-            st.caption("排序公式：0.30·ZPD贴近度 + 0.25·(1−掌握度) + "
-                       "0.20·中心性 + 0.15·目标相似度 + 0.10·认知契合")
+            st.caption("排序公式：0.28·ZPD贴近度 + 0.22·(1−掌握度) + 0.17·中心性 + "
+                       "0.13·目标相似度 + 0.10·认知契合 + 0.10·复习紧迫度")
 
     if state.plan.get("notes"):
         st.markdown(f"**整体安排**：{state.plan['notes']}")
+
+    # ===== 学习节奏与难度适配 =====
+    pacing = state.plan.get("pacing") or {}
+    if pacing.get("pace") is not None:
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            st.metric("节奏系数", f"{pacing.get('pace')}")
+        with c2:
+            st.metric("本批知识点", f"{pacing.get('batch')} 个")
+        with c3:
+            st.metric("难度带", f"{band.get('z_low')} ~ {band.get('z_high')}")
+        if pacing.get("focus"):
+            st.caption(f"🎯 难度与节奏适配：{pacing['focus']}（节奏由近 10 题正确率与卡壳次数动态计算）")
+
+    # ===== 今日待复习：间隔重复排程（1/3/7/15 天） =====
+    _review_section(env, state, profile)
+
+    # ===== 学习日历：近 7 天打卡 + 今日任务 =====
+    _study_calendar(state, env["mem"], items, plan_idx)
 
     # ===== 路径时间线 =====
     if not items:
@@ -66,11 +92,25 @@ def path_page():
             for it in items[:5]:
                 st.caption(f"**「{it['name']}」**：{it['reason']}")
 
+        # 评分构成：六因子分项明细（让人看到排序是算出来的）
+        with st.expander("📐 评分构成（前5个）"):
+            shown = False
+            for it in items[:5]:
+                terms = it.get("terms") or {}
+                if not terms:
+                    continue
+                shown = True
+                parts = " ＋ ".join(f"{k} {v:.3f}" for k, v in terms.items())
+                st.caption(f"**「{it['name']}」**（总分 {it['score']:.3f}）：{parts}")
+            if not shown:
+                st.caption("本批路径由 AI 定序，暂无公式评分明细。")
+
     # ===== 操作按钮 =====
     c1, c2, c3 = st.columns(3)
     with c1:
         if st.button("🔄 重新规划本批路径", use_container_width=True):
             orch._new_batch(state, "")
+            flash("已按最新学情重新规划本批路径", icon="🔄")
             st.rerun()
     with c2:
         in_progress = bool(items and plan_idx < len(items))
@@ -78,6 +118,7 @@ def path_page():
                      disabled=in_progress,
                      help="当前批次尚未学完；学完后可生成下一批"):
             orch._new_batch(state, "")
+            flash("已生成本批学习计划", icon="📦")
             st.rerun()
     if items and plan_idx < len(items):
         st.caption("💡 完成本批全部知识点后，才能生成下一批。")
@@ -85,6 +126,7 @@ def path_page():
         if st.button("🏁 结束会话", use_container_width=True,
                      disabled=state.phase == "reflecting"):
             orch.handle(state, "结束")
+            flash("已结束本次会话，正在生成学习反思", icon="🏁")
             st.rerun()
 
     st.divider()
@@ -134,14 +176,17 @@ def _timeline_view(items, plan_idx):
 
         if i < plan_idx:
             status_icon = "✅"
+            status_text = "已完成"
             status_color = "#34d399"
             bg_color = "rgba(52, 211, 153, 0.08)"
         elif i == plan_idx:
             status_icon = "▶️"
+            status_text = "学习中"
             status_color = "#22d3ee"
             bg_color = "rgba(34, 211, 238, 0.12)"
         else:
             status_icon = "⏳"
+            status_text = "待学习"
             status_color = "#64748b"
             bg_color = "rgba(100, 116, 139, 0.05)"
 
@@ -169,8 +214,79 @@ def _timeline_view(items, plan_idx):
                 padding: 4px 10px; border-radius: 999px;
                 border: 1px solid {status_color};
             ">
-                {['已完成','学习中','待学习'][min(i,2) if i!=plan_idx else 1] if i != plan_idx else '学习中'}
+                {status_text}
             </div>
         </div>
         """, unsafe_allow_html=True)
+
+
+def _review_section(env, state, profile):
+    """今日待复习：间隔重复排程中到期的知识点（跨会话，逾期排在最前）"""
+    mem, kg = env["mem"], env["kg"]
+    sid = profile.student_id
+    due = due_reviews(profile, kg, hits=mem.correct_by_node(sid),
+                      last_map=mem.last_ts_by_node(sid))
+    st.markdown("#### 🔁 今日待复习")
+    if not due:
+        st.caption("暂无到期复习项。学过的知识点会按 1 / 3 / 7 / 15 天的间隔自动排复习。")
+        return
+    overdue = [r for r in due if r["overdue"]]
+    st.markdown(f"**已逾期 {len(overdue)} 个 / 共 {len(due)} 个在复习排程中**")
+    for r in due[:8]:
+        tag = "⚠️ 已逾期" if r["overdue"] else f"还有 {r['days_left']} 天到期"
+        st.progress(min(1.0, r["urgency"]),
+                    text=f"{r['name']}（掌握度 {r['mastery']}）· "
+                         f"间隔 {r['interval_days']} 天 · {tag}")
+
+
+def _study_calendar(state, mem, items, plan_idx):
+    """学习日历：近 7 天（含今天）学习打卡 + 今日任务，把路径落到「每天做什么」"""
+    st.markdown("#### 🗓️ 学习日历")
+    sid = state.profile.student_id
+    # duration_by_day 的 day_offset：0 = 最早一天 … 6 = 今天
+    daily = {d["day_offset"]: d["seconds"] for d in mem.duration_by_day(sid, 7)}
+    nodes_by_day = _nodes_by_day(mem, sid, 7)
+    now = time.time()
+    cols = st.columns(7, gap="small")
+    for d_ago in range(6, -1, -1):        # 左→右：6 天前 → 今天
+        label = ("今天" if d_ago == 0 else
+                 "昨天" if d_ago == 1 else
+                 time.strftime("%m-%d", time.localtime(now - d_ago * 86400)))
+        mins = round(daily.get(6 - d_ago, 0.0) / 60)
+        done = len(nodes_by_day.get(d_ago, ()))
+        with cols[6 - d_ago]:
+            with st.container(border=True):
+                st.markdown(f"**{label}**")
+                st.caption(f"学习 {mins} 分钟")
+                st.caption(f"完成 {done} 个知识点" if done else "—")
+
+    today_tasks = items[plan_idx:] if plan_idx < len(items) else []
+    if today_tasks:
+        st.markdown("**📌 今日任务**：" + "、".join(
+            f"{i + 1}. {it['name']}"
+            for i, it in enumerate(today_tasks, start=plan_idx)))
+        if st.button("▶ 开始今日学习", type="primary", key="cal_start"):
+            st.switch_page(st.Page(chat_page))
+    else:
+        st.caption("🎉 本批知识点已全部学完，可以去生成下一批。")
+
+
+def _nodes_by_day(mem, sid, days=7):
+    """近 N 天每天「真正学完」的知识点集合（0 = 今天），用于日历打卡展示
+
+    只认教学完成记录：摸底/练习答题只是作答证据，不该计成「完成知识点」，
+    否则一次摸底会被日历显示成「学会了好几个知识点」，误导学生对进度的认知。
+    """
+    now = time.time()
+    out = {}
+    for r in mem.recent_interactions(sid, limit=800):
+        nid = r.get("node_id")
+        if not nid or r.get("kind") != "teach":
+            continue
+        if "完成" not in (r.get("content") or ""):
+            continue
+        off = int((now - (r.get("ts") or now)) // 86400)
+        if 0 <= off < days:
+            out.setdefault(off, set()).add(nid)
+    return out
 

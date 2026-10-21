@@ -19,9 +19,12 @@ from src.agent.state import (AgentState, IDLE, DIAGNOSING, QUIZZING, TEACHING,
 from src.memory.reflection import maybe_reflect
 from src.memory.retrieve import build_context, retrieve_node, stats_json
 from src.path.pacing import pace_params
+from src.path.review import urgency_map
 from src.student.diagnosis import AdaptiveQuiz, build_report
-from src.student.profile import StudentProfile, init_mastery
-from src.student.update import apply_forgetting, mastery_update
+from src.student.error_cause import error_cause
+from src.student.profile import StudentProfile, goal_node_names, init_mastery
+from src.student.update import (apply_forgetting, mastery_update, propagate,
+                                revise_mastery, undo_propagate)
 from src.tutor.scaffold import LEVELS, Scaffolder, detect_stuck
 from src.tutor.teach import segment_count, split_segments, teach_segment
 from src.agent.milestones import check_milestones, milestone_message
@@ -30,9 +33,19 @@ from src.agent.chitchat import (correct_reply, wrong_reply, stuck_reassure,
                                 diagnosis_confirm, path_begin, continue_lecture,
                                 welcome_back)
 from src.student.question_filter import goals_to_tags, next_question_for_node
+from src.student.question_gen import gen_question
 from src.utils.logger import get_logger
 
 logger = get_logger(__name__)
+
+# 动态出题：同一知识点在本会话内最多现场补几道题（防止无限出题）
+GEN_CAP_PER_NODE = 3
+
+# 「继续」类推进词：讲义段末带 [ASK:] 提问位时，先说这两类词会先被请去回应提问，
+# 避免带提问的段落被当成旁白一路跳过。刻意不含「嗯/好的」这类追问回答语。
+_CONTINUE_WORDS = ("继续", "下一个", "下一段", "往下", "往下看", "next", "continue", "go on")
+# 明确表示「不想回答这个提问」的跳过词：命中时直接推进，不再拦。
+_SKIP_ASK_WORDS = ("跳过", "略过", "不想回答", "不知道", "直接往下", "先往下")
 
 # ---------- 对话诊断 ----------
 DIAG_QUESTIONS = [
@@ -41,6 +54,35 @@ DIAG_QUESTIONS = [
     "之前学过哪些数学或机器学习基础？比如高等数学、线性代数、概率统计……"
     "没学过也没关系，直说就行。",
     "这次想重点攻克什么方向？比如深度学习、经典算法、面试求职、期末备考……",
+]
+
+# 专业 → 后续提问：不同专业该问的先修课不同（决定「根据专业提问」）
+MAJOR_PRIOR_HINTS = [
+    (("计算机", "软件", "人工智能", "智能", "数据", "电子", "自动化", "信息", "网络"),
+     "高等数学、线性代数、概率统计、数据结构",
+     "你是计算机相关专业，{courses} 这些大概率接触过——具体学过哪些？哪门学得比较吃力？"),
+    (("数学", "统计", "物理"),
+     "数学分析（高等数学）、高等代数（线性代数）、概率统计、数值分析",
+     "你的专业数理要求高，通常学过 {courses}——分别掌握到什么程度？"
+     "有哪门是「学过但没学透」的？"),
+    (("管理", "经济", "金融", "商", "会计", "市场"),
+     "微积分、线性代数、概率统计、统计学",
+     "经管类一般开设 {courses}——你学过哪些？概率统计这块感觉如何？"),
+    (("文", "法", "教育", "外语", "新闻", "历史", "艺术", "哲学", "设计"),
+     "高等数学、线性代数、概率统计",
+     "你的专业偏文科，学机器学习要先补一点数学——{courses} 这些接触过吗？"),
+]
+
+# 专业 → 目标提问的示例方向（让「想学什么」也更贴合专业）
+MAJOR_GOAL_EXAMPLES = [
+    (("计算机", "软件", "人工智能", "智能", "数据", "电子", "自动化", "信息", "网络"),
+     "深度学习、算法竞赛、课程设计、面试求职"),
+    (("数学", "统计", "物理"),
+     "深度学习、统计学习、科研方向、读文献做实验"),
+    (("管理", "经济", "金融", "商", "会计", "市场"),
+     "数据分析、业务建模、用户画像、面试求职"),
+    (("文", "法", "教育", "外语", "新闻", "历史", "艺术", "哲学", "设计"),
+     "AI 应用入门、数据分析、行业研究、期末备考"),
 ]
 
 # 先验映射：关键词 → 节点先验（0.5 表示"学过一点"，1.0 表示"学过"）
@@ -80,6 +122,7 @@ class Orchestrator:
         self.qs_by_node = {}
         for q in questions:
             self.qs_by_node.setdefault(q["node_id"], []).append(q)
+        self.q_by_id = {q["id"]: q for q in questions if q.get("id")}
 
     # ==================== 会话生命周期 ====================
     def start_session(self, state: AgentState) -> tuple:
@@ -98,10 +141,23 @@ class Orchestrator:
             return reply, self._payload(state)
         state.profile = profile
         now = time.time()
-        for nid, ts in list(profile.last_seen.items()):
+        # 遗忘衰减：以「知识点最近一次交互」为接触时间。该时间取自 interactions 表
+        # （跨会话有效，重启后仍在），回填到 profile.last_seen 后按间隔天数衰减；
+        # 间隔 < 1 天不衰减，未被作答过的节点（mastery 缺失）不参与。
+        last_map = self.mem.last_ts_by_node(state.student_id)
+        profile.last_seen.update(last_map)
+        for nid, ts in last_map.items():
+            if nid not in profile.mastery:
+                continue
             days = (now - ts) / 86400.0
             if days >= 1.0:
                 apply_forgetting(profile, nid, days)
+        # 提示依赖度与待复习标记同样只在内存里（不落库），从库派生后回填，保证跨会话有效：
+        # ①hint_profile ← hint_usage 里每个节点用过的最高提示层级；
+        # ②needs_review ← 答错过的知识点所对应的先修集（与 update.py 的标记口径一致）。
+        profile.hint_profile.update(self.mem.hint_levels_by_node(state.student_id))
+        for nid in self.mem.wrong_node_ids(state.student_id):
+            profile.needs_review.update(self.kg.prereqs_of(nid))
         state.session_id = self.mem.start_session(state.student_id)
         if not self.mem.has_study_history(state.student_id):
             reply = self._first_learn_greeting(profile.name)
@@ -110,19 +166,56 @@ class Orchestrator:
             ctx = build_context(self.mem, state.student_id,
                                 preview.get("next_session_preview", ""), preview)
             reply = self._greeting(ctx or preview.get("next_session_preview", ""))
-        self._new_batch(state)
-        if not state.plan.get("items"):
-            return (reply + "\n\n你的知识点掌握得都很扎实，可以自由选择想学的内容。",
-                    self._payload(state))
-        begin = self._begin_node(state, state.plan["items"][0])
-        return reply + "\n\n" + begin, self._payload(state)
+        # 直接用 _new_batch 的返回：其中已含「本次反思调整说明 + 首个知识点导入」
+        batch_reply, payload = self._new_batch(state)
+        return reply + "\n\n" + batch_reply, payload
 
     def restart_diagnosis(self, state: AgentState) -> str:
         """清空会话重新诊断：新建空白画像并进入诊断，返回开场白（不恢复旧画像）"""
         state.profile = StudentProfile(student_id=state.student_id)
         state.phase = DIAGNOSING
         state.diagnosis_step = 0
-        return self._greeting(None) + "\n\n" + DIAG_QUESTIONS[0]
+        return greeting_new() + "\n\n" + DIAG_QUESTIONS[0]
+
+    def start_role_diagnosis(self, state: AgentState, name: str, major: str,
+                             goals: list) -> str:
+        """角色一键体验：用预置背景（称呼/专业/目标）建档后直接进入摸底测验。
+
+        与「演示账号」的区别：这里只填背景，不预置掌握度——学生的真实基础
+        全部由摸底测验测得，再据此生成路径与教学节奏。返回开场白。
+        """
+        profile = StudentProfile(student_id=state.student_id)
+        profile.name = name or "同学"
+        profile.major = major or ""
+        profile.goals = [g for g in (goals or []) if g][:2]
+        profile.goal_keywords = self._parse_goals(" ".join(profile.goals))
+        init_mastery(profile, self.kg)
+        self.mem.save_student(profile)
+        state.profile = profile
+        state.session_id = self.mem.start_session(state.student_id)
+        self.mem.log_interaction(
+            state.session_id, state.student_id, "message", "",
+            f"角色体验建档：专业={profile.major or '未填'}；"
+            f"学习目标={'、'.join(profile.goals) or '未填'}")
+        lead = [f"你好，{profile.name}！"]
+        analysis = self._analysis_major(profile, profile.major)
+        if analysis:
+            lead.append(analysis)
+        goal_note = self._analysis_goal(profile)
+        if goal_note:
+            lead.append(goal_note)
+        lead.append("先做几道摸底题，我按你的实际水平来安排学习路径和节奏。")
+        state.phase = QUIZZING
+        state.quiz_state = self.quiz.new_state(profile)
+        q = self.quiz.next_question(state.quiz_state)
+        if q.get("id") is None:
+            # 题库耗尽：直接收敛进入教学，绝不把空题（{"id": None}）丢给弹窗——
+            # 否则弹窗会打开却没有题干、没有选项。
+            return "\n\n".join(lead) + "\n\n" + self._quiz_finished(state)[0]
+        state.current_question = q
+        state.used_qids.append(q["id"])
+        return ("\n\n".join(lead) + "\n\n" + quiz_start() + "\n\n"
+                + self._fmt_question(q))
 
     # ==================== 主入口 ====================
     def handle(self, state: AgentState, text: str) -> tuple:
@@ -306,9 +399,7 @@ class Orchestrator:
             return ("我没找到这个知识点，换个说法试试？比如「练习 线性回归」。"
                     "也可以先问「什么是 XX」了解它。"), self._payload(state)
         # 按学习目标筛选题目
-        goal_tags = goals_to_tags(state.profile) if state.profile else {"general"}
-        q = next_question_for_node(self.qs_by_node.get(nid, []), goal_tags,
-                                    state.used_qids)
+        q = self._select_question(state, nid)
         if q is None:
             return f"「{self.kg.nodes[nid].name}」的练习题都做过了，换个知识点吧。", self._payload(state)
         if not keep_resume:
@@ -339,10 +430,8 @@ class Orchestrator:
         if len(state.last_results) > 8:
             state.last_results.pop(0)
         fb = self._answer_explanation(q, correct)
-        # 按学习目标选下一题
-        goal_tags = goals_to_tags(state.profile) if state.profile else {"general"}
-        nq = next_question_for_node(self.qs_by_node.get(state.practice_node, []),
-                                    goal_tags, state.used_qids)
+        # 按学习目标选下一题；题库耗尽时动态生成新题
+        nq = self._select_question(state, state.practice_node)
         if nq is None:
             node = self.kg.nodes[state.practice_node]
             done_msg = (f"「{node.name}」的题都练完啦！可以说「练习 XX」换个知识点，"
@@ -376,10 +465,12 @@ class Orchestrator:
             return self._diagnosis_confirm(state, text)
         if step == 0:
             profile.name = self._parse_name(text)
-            reply = f"你好，{profile.name}！" + DIAG_QUESTIONS[1]
+            reply = f"你好，{profile.name}！" + self._analysis_major(profile, "") \
+                + "\n\n" + self._adapt_question(1, profile)
+            profile.major = ""   # 专业留到下一位回答
         elif step == 1:
             profile.major = text.strip()[:30]
-            reply = DIAG_QUESTIONS[2]
+            reply = self._analysis_major(profile, text) + "\n\n" + self._adapt_question(2, profile)
         elif step == 2:
             parsed = self._extract_prior_llm(text)
             if parsed is None:  # 离线/故障：规则解析兜底
@@ -389,11 +480,84 @@ class Orchestrator:
             else:
                 profile.prior.update(parsed["prior"])
                 self._merge_style_tags(profile, parsed["tags"])
-            reply = DIAG_QUESTIONS[3]
+            reply = self._analysis_prior(profile) + "\n\n" + self._adapt_question(3, profile)
         else:
             return self._diagnosis_done(state, text)
         state.diagnosis_step += 1
         return reply, self._payload(state)
+
+    # ---------- 对话诊断：动态分析（每步读学生实际回答 + 知识图谱） ----------
+    def _analysis_major(self, profile, text) -> str:
+        """根据专业/学校自述推断学科背景，给出针对性的学习安排说明"""
+        major = (text or profile.major or "").strip()
+        if not major:
+            return ("接下来我会边聊边给你建学习档案，了解清楚后就能给你排一条"
+                    "只属于你的学习路径。")
+        if any(w in major for w in ("计算机", "软件", "人工智能", "智能", "数据",
+                                    "电子", "自动化", "信息", "网络")):
+            return (f"你是{major}方向的同学，编程和工程实践上应该不吃亏，"
+                    f"机器学习里偏应用的算法你会学得更快；数学基础我一会儿单独确认一下。")
+        if any(w in major for w in ("数学", "统计", "物理")):
+            return (f"你的{major}背景意味着数理底子通常比较扎实，我会多讲原理和推导，"
+                    f"让你从根上理解模型为什么这样设计。")
+        if any(w in major for w in ("管理", "经济", "金融", "商", "会计")):
+            return (f"你是{major}背景，更看重应用和业务价值，我会多用案例和业务场景来讲，"
+                    f"少堆公式，先把「能用起来」放在第一位。")
+        if any(w in major for w in ("文", "法", "教育", "外语", "新闻", "历史", "艺术")):
+            return (f"你是{major}背景也完全没问题——我会把概念讲成生活里的例子，"
+                    f"需要数学时再补最必要的那一点，不会一上来就砸公式。")
+        return (f"了解了，你是{major}方向。机器学习的入门门槛其实没那么高，"
+                f"我会按你的基础和节奏来安排内容。")
+
+    def _analysis_prior(self, profile) -> str:
+        """根据先修自述识别到的知识点，说明后续会如何利用这些基础"""
+        names = [self.kg.nodes[n].name for n in profile.prior if n in self.kg.nodes]
+        if not names:
+            return ("没关系，零基础可以从头学起——我会把基础概念拆得更细，"
+                    "每个知识点都配一道小题确认你真的懂了，再往前走。")
+        if len(names) >= 3:
+            return (f"我注意到你已经接触过 {', '.join(names[:4])} 等 {len(names)} 个相关知识点，"
+                    f"这些我会作为你的已有基础：直接跳过基础讲解、用更难的题验证，"
+                    f"把时间留给真正薄弱的环节。")
+        return (f"你提到学过 {', '.join(names)}，我先按已有基础处理——"
+                f"接下来用几道题验证一下，确实扎实就直接往上学。")
+
+    def _analysis_goal(self, profile) -> str:
+        """根据学习目标与图谱映射，说明路径与题目会如何贴合这个目标"""
+        goals = profile.goals or []
+        goal = goals[0] if goals else ""
+        nodes = goal_node_names(profile, self.kg)[:4]
+        if nodes:
+            return (f"你的目标是「{goal}」，我会把 {', '.join(nodes)} 等相关知识点"
+                    f"优先排进路径，并让出题更贴近这个方向。")
+        if goal:
+            return f"你的目标是「{goal}」，我会据此调整路径排序与出题取向。"
+        return ""
+
+    def _adapt_question(self, idx, profile) -> str:
+        """按已有画像调整下一问的措辞（问题内核不变，保证信息可解析）"""
+        base = DIAG_QUESTIONS[idx]
+        if idx == 2:
+            # 先修提问随专业变化：不同专业该确认的课程不同
+            major = profile.major or ""
+            for keys, courses, tpl in MAJOR_PRIOR_HINTS:
+                if any(w in major for w in keys):
+                    return tpl.format(courses=courses) + "没学过也没关系，直说就行。"
+            return base
+        if idx == 3:
+            examples = "深度学习、经典算法、面试求职、期末备考"
+            major = profile.major or ""
+            for keys, ex in MAJOR_GOAL_EXAMPLES:
+                if any(w in major for w in keys):
+                    examples = ex
+                    break
+            if profile.prior:
+                names = [self.kg.nodes[n].name for n in profile.prior if n in self.kg.nodes]
+                return (f"基础这块我记下了（{', '.join(names[:3])}）。"
+                        f"这次想重点攻克什么方向？比如{examples}……")
+            return (f"基础这块我记下了。这次想重点攻克什么方向？"
+                    f"比如{examples}……")
+        return base
 
     def _diagnosis_done(self, state, text):
         profile = state.profile
@@ -410,16 +574,24 @@ class Orchestrator:
         self.mem.save_student(profile)
         state.session_id = self.mem.start_session(state.student_id)
         self.mem.log_interaction(state.session_id, state.student_id, "message", "",
-                                 f"对话诊断完成 prior={json.dumps(profile.prior, ensure_ascii=False)} "
-                                 f"goals={json.dumps(profile.goal_keywords, ensure_ascii=False)}")
+                                 self._diagnosis_log(profile))
         # 诊断确认环节：展示摘要，让学生确认或修正
         state.phase = DIAGNOSING
         state.diagnosis_step = 99  # 标记为确认阶段
         summary = self._diagnosis_summary(profile)
+        goal_note = self._analysis_goal(profile)
         reply = (f"{diagnosis_confirm()}\n\n{summary}\n\n"
-                 "如果这些信息准确，请回复「确认」开始做摸底测验；"
+                 + (goal_note + "\n\n" if goal_note else "")
+                 + "如果这些信息准确，请回复「确认」开始做摸底测验；"
                  "如果有需要修正的地方，直接告诉我（比如「我的专业是计算机」）。")
         return reply, self._payload(state)
+
+    def _diagnosis_log(self, profile) -> str:
+        """诊断落库文案：写成学生看得懂的自然语言（历史对话页会直接展示）"""
+        prior_names = [self.kg.nodes[n].name for n in profile.prior if n in self.kg.nodes]
+        return (f"完成学情诊断：专业={profile.major or '未填'}；"
+                f"已有基础={'、'.join(prior_names[:5]) or '零基础'}；"
+                f"学习目标={'、'.join(profile.goals[:2]) or '未填'}")
 
     def _diagnosis_summary(self, profile) -> str:
         """生成诊断摘要，供学生确认"""
@@ -445,6 +617,9 @@ class Orchestrator:
             state.phase = QUIZZING
             state.quiz_state = self.quiz.new_state(profile)
             q = self.quiz.next_question(state.quiz_state)
+            if q.get("id") is None:
+                # 题库耗尽：直接收敛，避免弹出「没有题干、没有选项」的空题弹窗
+                return self._quiz_finished(state)
             state.current_question = q
             state.used_qids.append(q["id"])
             reply = (quiz_start() + "\n\n"
@@ -480,6 +655,122 @@ class Orchestrator:
             return (f"已更新：{', '.join(updated)}\n\n更新后的信息：\n{summary}\n\n"
                     "还有要改的吗？没问题就回复「确认」。"), self._payload(state)
 
+    # ---------- 摸底测验弹窗动作（跳过 / 提前结束，由 UI 直接调用） ----------
+    def quiz_skip(self, state) -> str:
+        """跳过当前检测题：不计分、不计覆盖，换一道同节点题目；换不出来则直接收尾"""
+        if state.phase != QUIZZING or not state.current_question:
+            return ""
+        qs = state.quiz_state
+        qs.skipped.add(state.current_question["id"])
+        nq = self.quiz.next_question(qs)
+        if nq.get("id") is not None:
+            state.current_question = nq
+            state.used_qids.append(nq["id"])
+            return ""
+        reply, _ = self._quiz_finished(state)
+        state.history.append({"role": "user", "content": "跳过本题"})
+        state.history.append({"role": "assistant", "content": reply})
+        return reply
+
+    def quiz_finish(self, state) -> str:
+        """学生主动结束摸底测验：按已答情况生成画像与学习路径，并写入对话记录"""
+        if state.phase != QUIZZING:
+            return ""
+        self.quiz.stop(state.quiz_state, "学生叫停")
+        reply, _ = self._quiz_finished(state)
+        state.history.append({"role": "user", "content": "提交"})
+        state.history.append({"role": "assistant", "content": reply})
+        return reply
+
+    def quiz_answer(self, state, text) -> str:
+        """摸底弹窗作答（UI 直接调用）：静默记轨迹，不写逐题对错、不贴题进对话
+
+        学生在弹窗里一道道选，全程不给对错反馈；这里只更新掌握度与自适应轨迹。
+        全部答完（或主动提交）时才把「诊断报告 + 首个知识点」写进对话。
+        """
+        if state.phase != QUIZZING or not state.current_question or not state.quiz_state:
+            return ""
+        qs = state.quiz_state
+        q = state.current_question
+        choice = self._choice(text, {})
+        if choice is None:
+            return ""
+        correct = choice == q.get("answer")
+        node_id = qs.current_node
+        theta_before = state.profile.mastery.get(node_id, 0.45)
+        evidence_before = state.profile.evidence_count.get(node_id, 0)
+        theta = mastery_update(state.profile, self.kg, node_id, correct, kind="quiz")
+        self._log_attempt(state, q, correct, theta, node_id=node_id, choice=choice)
+        self.quiz.record(qs, q, correct, choice, theta_before, evidence_before)
+        state.last_results.append(correct)
+        if len(state.last_results) > 8:
+            state.last_results.pop(0)
+        if qs.finished:
+            reply, _ = self._quiz_finished(state)
+            state.history.append({"role": "user", "content": "（完成摸底测验）"})
+            state.history.append({"role": "assistant", "content": reply})
+            return reply
+        nq = self.quiz.next_question(qs)
+        if nq.get("id") is None:
+            reply, _ = self._quiz_finished(state)
+            state.history.append({"role": "user", "content": "（完成摸底测验）"})
+            state.history.append({"role": "assistant", "content": reply})
+            return reply
+        state.current_question = nq
+        state.used_qids.append(nq["id"])
+        return ""
+
+    def quiz_edit_answer(self, state, index: int, text: str) -> str:
+        """回看历史检测题并修改作答：重写该题记录，并按新对错重算画像与错题口径
+
+        index 为该题在 quiz_state.answers 中的下标；text 为选项原文（含字母）。
+        只在摸底测验进行中有效；已出的题（自适应轨迹）不回退。
+        """
+        if state.phase != QUIZZING or not state.quiz_state:
+            return ""
+        qs = state.quiz_state
+        if not (0 <= index < len(qs.answers)):
+            return ""
+        node_id, qid, old_correct, old_choice = qs.answers[index][:4]
+        choice = self._choice(text, {})
+        if not choice or choice == old_choice:
+            return ""
+        q = self.q_by_id.get(qid) or {}
+        correct = bool(q) and choice == q.get("answer")
+        qs.answers[index] = (node_id, qid, correct, choice,
+                             qs.answers[index][4], qs.answers[index][5])
+        if correct != old_correct:
+            self._recompute_quiz_node(state, node_id, old_correct, correct)
+        theta = state.profile.mastery.get(node_id, 0.45)
+        self.mem.revise_attempt(state.student_id, qid, correct, theta, choice=choice)
+        return ""
+
+    def _recompute_quiz_node(self, state, node_id, old_correct, new_correct) -> None:
+        """改答后重算该节点画像：撤销旧作答传播 → 按新对错序列重放 → 重施新传播"""
+        profile = state.profile
+        qs = state.quiz_state
+        entries = [a for a in qs.answers if a[0] == node_id]
+        base_theta, base_ev = entries[0][4], entries[0][5]
+        if base_theta is None or base_ev is None:   # 旧数据无基准：仅改记录，不动画像
+            return
+        undo_propagate(profile, self.kg, node_id, old_correct)
+        revise_mastery(profile, self.kg, node_id,
+                       [a[2] for a in entries], base_theta, base_ev)
+        propagate(profile, self.kg, node_id, new_correct)
+        self.mem.snapshot_mastery(state.student_id, node_id,
+                                  profile.mastery.get(node_id, 0.0),
+                                  profile.evidence_count.get(node_id, 0))
+
+    def log_practice(self, state, q, correct: bool, choice: str = "") -> float:
+        """错题重练作答落库：与测验同口径更新掌握度并写作答记录，返回新掌握度
+
+        供错题本「一键组卷重练」复用，不改变对话状态机相位。
+        """
+        node_id = q.get("node_id") or state.current_node
+        theta = mastery_update(state.profile, self.kg, node_id, correct, kind="quiz")
+        self._log_attempt(state, q, correct, theta, node_id=node_id, choice=choice)
+        return theta
+
     def _quiz_turn(self, state, text, intent):
         qs = state.quiz_state
         q = state.current_question
@@ -488,9 +779,12 @@ class Orchestrator:
             return ("这是水平摸底测验，尽量凭感觉选一个（回复 A/B/C/D 即可），"
                     "实在不确定就选最像的。"), self._payload(state)
         correct = choice == q["answer"]
-        theta = mastery_update(state.profile, self.kg, qs.current_node, correct, kind="quiz")
-        self._log_attempt(state, q, correct, theta)
-        self.quiz.record(qs, q, correct)
+        node_id = qs.current_node
+        theta_before = state.profile.mastery.get(node_id, 0.45)
+        evidence_before = state.profile.evidence_count.get(node_id, 0)
+        theta = mastery_update(state.profile, self.kg, node_id, correct, kind="quiz")
+        self._log_attempt(state, q, correct, theta, node_id=node_id, choice=choice)
+        self.quiz.record(qs, q, correct, choice, theta_before, evidence_before)
         state.last_results.append(correct)
         if len(state.last_results) > 8:
             state.last_results.pop(0)
@@ -519,9 +813,15 @@ class Orchestrator:
         report = build_report(profile, self.kg, self.planner, state.quiz_state)
         stuck = sum(1 for c in state.last_results if not c)
         params = pace_params(report["accuracy"], stuck)
-        state.plan = self.planner.plan(profile, batch=params["batch"])
         state.plan_idx = 0
         state.report = report
+        # 首批路径同样走「大模型定序 + 个性化理由」通道（离线由 Mock 规则路由）
+        state.plan = self._llm_order(
+            state, self.planner.plan(profile, batch=params["batch"], pace=params["pace"],
+                                     review=self._review_urgency(state)))
+        # 报告建议起点与实际首个教学节点同源：学生点开第一课不会与报告不符
+        if state.plan.get("items"):
+            report["suggested"] = state.plan["items"][0]["name"]
         self.mem.save_plan(state.session_id, state.student_id, params["pace"],
                            state.plan["band"], state.plan)
         self.mem.log_interaction(state.session_id, state.student_id, "report", "",
@@ -539,7 +839,24 @@ class Orchestrator:
             state.current_node = ""
             return diag + "\n\n你的知识点掌握得都很好，可以自由选择想学的内容。", self._payload(state)
         begin = self._begin_node(state, state.plan["items"][0])
-        return diag + "\n\n" + begin, self._payload(state)
+        return diag + "\n\n" + self._pace_note(params, report) + "\n\n" + begin, self._payload(state)
+
+    @staticmethod
+    def _pace_note(params: dict, report: dict) -> str:
+        """学习节奏与难度适配说明（让人看到「节奏是算出来的」）"""
+        acc = report.get("accuracy")
+        total = report.get("total_questions", 0)
+        acc_txt = (f"摸底正确率 {round(acc * 100)}%" if isinstance(acc, (int, float))
+                   and total else "起步阶段")
+        pace, batch = params["pace"], params["batch"]
+        if pace >= 1.2:
+            rhythm = "表现不错，节奏加快"
+        elif pace <= 0.6:
+            rhythm = "先把每一步打牢，节奏放缓"
+        else:
+            rhythm = "节奏保持适中"
+        return (f"📈 学习节奏：{acc_txt} → 节奏系数 {pace}，本批安排 {batch} 个知识点"
+                f"（{rhythm}）；难度带也会随节奏放宽或收紧。")
 
     def _teach_turn(self, state, text, intent):
         profile = state.profile
@@ -551,9 +868,16 @@ class Orchestrator:
             return self._new_batch(state)
         if state.current_question is not None:
             return self._grade_attempt(state, text, intent, in_scaffold=False)
-        # 讲义讲解中：卡住 → 脚手架
+        # 讲义分段末尾是 [ASK:] 提问位时，直接说「继续」先请他回应提问——否则带提问
+        # 的段落会被当作旁白一路跳过，提问位就白设了（想说「跳过」则放行）
+        if (self._pending_ask(state) and self._is_continue(text)
+                and not any(w in text for w in _SKIP_ASK_WORDS)):
+            return ("这一段末尾我留了个小问题，想先听你怎么想：用你自己的话说一句就行，"
+                    "说得对不对都没关系，我再顺着往下讲。\n\n"
+                    "（想先跳过这个提问，就说「跳过」。）"), self._payload(state)
+        # 讲义讲解中：卡住 → 先把当前这一段换个说法重讲（而不是马上拉去做题）
         if intent == "confusion" or detect_stuck(state.scaffold, intent, text, state.last_results):
-            return self._engage_scaffold(state, stuck_reassure())
+            return self._reteach(state, stuck_reassure())
         # 学生回应 [ASK:] 提问 → 软证据 + 推进分段
         if intent in ("answer", "question"):
             theta = mastery_update(profile, self.kg, state.current_node, 0.5, kind="dialog")
@@ -575,6 +899,50 @@ class Orchestrator:
     def _intervene_turn(self, state, text, intent):
         return self._grade_attempt(state, text, intent, in_scaffold=True)
 
+    @staticmethod
+    def _is_continue(text: str) -> bool:
+        """是否为「继续 / 往下」类推进输入"""
+        return any(w in (text or "") for w in _CONTINUE_WORDS)
+
+    def _pending_ask(self, state) -> bool:
+        """当前讲义分段末尾是否挂着 [ASK:] 提问位（学生还没回应）"""
+        node = self.kg.nodes.get(state.current_node or "")
+        if node is None:
+            return False
+        segs = split_segments(node.lecture or "")
+        if not segs:
+            return False
+        i = min(max(state.lecture_para, 0), len(segs) - 1)
+        return "[ASK:]" in segs[i]
+
+    def _reteach(self, state, preamble):
+        """重讲当前讲义分段：不换知识点、不跳去做题
+
+        学生在讲义里说「我不会」时，先把这一段换个说法重讲一遍并点一个抓手；
+        同一分段重讲过一次还卡住，才进入阶梯式脚手架。
+        """
+        node = self.kg.nodes.get(state.current_node or "")
+        if node is None or not node.lecture:
+            return (preamble + "\n\n我们回到刚才的知识点——你说说具体卡在哪一步？"
+                    "我再顺着你的卡点讲。"), self._payload(state)
+        segs = split_segments(node.lecture or "")
+        idx = min(max(state.lecture_para, 0), max(len(segs) - 1, 0))
+        if idx == state.reteach_para:            # 这一段已经重讲过 → 升级为阶梯提示
+            return self._engage_scaffold(state, preamble)
+        state.reteach_para = idx
+        seg = segs[idx] if segs else ""
+        body = [b.strip() for b in seg.split("\n\n")
+                if b.strip() and not b.startswith("[ASK:]")]
+        tip = body[0] if body else (node.summary or "")
+        retell = self._fast_call(
+            lambda: teach_segment(self.llm, state.current_node, idx, seg))
+        if retell is None:   # 真实模型超时：离线 Mock 讲义兜底
+            retell = teach_segment(getattr(self.llm, "fallback", self.llm),
+                                   state.current_node, idx, seg)
+        tail = f"先抓住一点就够：{tip}" if tip else "有哪一步没跟上，直接说，我从那里再讲。"
+        return (preamble + "\n\n别急，这一段我换个说法再讲一遍：\n\n" + retell
+                + "\n\n" + tail), self._payload(state)
+
     # ==================== 作答判定与脚手架 ====================
     def _grade_attempt(self, state, text, intent, in_scaffold):
         q = state.current_question
@@ -592,7 +960,7 @@ class Orchestrator:
                     "哪里不清楚也可以直接告诉我。"), self._payload(state)
         correct = choice == q["answer"]
         theta = mastery_update(state.profile, self.kg, state.current_node, correct, kind="quiz")
-        self._log_attempt(state, q, correct, theta)
+        self._log_attempt(state, q, correct, theta, choice=choice)
         state.last_results.append(correct)
         if len(state.last_results) > 8:
             state.last_results.pop(0)
@@ -621,7 +989,13 @@ class Orchestrator:
                     "我再帮你往下理。"), self._payload(state)
         state.current_question = q
         state.used_qids.append(q["id"])
-        r = self.scaffolder.engage(state.scaffold, q["id"], state.current_node)
+        # 错因靶向（C1）：用「连错次数 + 掌握度 + 难度」判错因，L0 提示按错因反问；
+        # 起始层级（C2）：该生在该节点历史退出层级越高（提示依赖越强），起步层级越高
+        cause, _ = error_cause(q, state.profile,
+                               count=1 + state.scaffold.wrong_streak)
+        hist = state.profile.hint_profile.get(state.current_node, 0)
+        r = self.scaffolder.engage(state.scaffold, q["id"], state.current_node,
+                                   cause=cause, start_level=1 if hist >= 2 else 0)
         state.phase = INTERVENING
         self._log_hint(state, r["level"])
         return preamble + "\n\n" + (r["text"] or "先想一想，这题在考哪个知识点？"), self._payload(state)
@@ -637,6 +1011,7 @@ class Orchestrator:
         ms_msg = milestone_message(new_ms) if new_ms else ""
         state.current_question = None
         state.lecture_para = 0
+        state.reteach_para = -1
         state.plan_idx += 1
         items = state.plan.get("items", [])
         if state.plan_idx < len(items):
@@ -652,6 +1027,7 @@ class Orchestrator:
     def _begin_node(self, state, item) -> str:
         state.current_node = item["node_id"]
         state.lecture_para = 0
+        state.reteach_para = -1
         state.current_question = None
         state.phase = TEACHING
         node = self.kg.nodes[item["node_id"]]
@@ -677,10 +1053,35 @@ class Orchestrator:
         return reply, self._payload(state)
 
     def _next_question_for(self, state):
-        """从当前节点选题：按学习目标匹配度优先"""
-        questions = self.qs_by_node.get(state.current_node, [])
+        """从当前节点选题：题库优先，题库耗尽时按画像动态生成新题"""
+        return self._select_question(state, state.current_node)
+
+    def _select_question(self, state, node_id):
+        """选题：静态题库（按学习目标匹配度排序）优先；耗尽后现场生成新题"""
+        if not node_id:
+            return None
         goal_tags = goals_to_tags(state.profile) if state.profile else {"general"}
-        return next_question_for_node(questions, goal_tags, state.used_qids)
+        q = next_question_for_node(self.qs_by_node.get(node_id, []), goal_tags,
+                                    state.used_qids)
+        if q is not None:
+            return q
+        return self._generate_question(state, node_id)
+
+    def _generate_question(self, state, node_id):
+        """题库耗尽时的动态出题：真实大模型生成，离线走规则兜底
+
+        按节点限额（同节点本会话最多补 GEN_CAP_PER_NODE 道），避免无限出题；
+        生成题 id 形如 gen_<node_id>_<n>，据此计数。
+        """
+        prefix = f"gen_{node_id}_"
+        made = sum(1 for qid in state.used_qids if str(qid).startswith(prefix))
+        if made >= GEN_CAP_PER_NODE:
+            return None
+        q = gen_question(self.llm, self.kg, node_id, state.profile, variant=made)
+        if not q or not q.get("options"):
+            return None
+        q["id"] = f"{prefix}{made}"
+        return q
 
     # ==================== 重规划与批次 ====================
     def _replan(self, state, trigger="stuck_l3"):
@@ -718,21 +1119,78 @@ class Orchestrator:
         begin = self._begin_node(state, self._make_item(state, new_node, "复习"))
         return (action.get("reason", "为你重新调整了学习路径") + "\n\n" + begin), self._payload(state)
 
+    def _review_urgency(self, state) -> dict:
+        """知识点 → 复习紧迫度（路径评分第 6 因子；来源于间隔重复排程）"""
+        hits = self.mem.correct_by_node(state.student_id)
+        last = self.mem.last_ts_by_node(state.student_id)
+        return urgency_map(state.profile, self.kg, hits=hits, last_map=last)
+
+    def _pending_adjust(self, state) -> dict:
+        """上次会话反思的结构化调整（D1 闭环）：本会话首次规划时消费一次
+
+        取上一次会话反思的 adjust（review_nodes / pace_hint / note）；用
+        reflection_used 守卫，保证同一调整不会在后续批次里反复生效。
+        """
+        if state.reflection_used:
+            return {}
+        state.reflection_used = True
+        prev = self.mem.last_reflection(state.student_id,
+                                        exclude_session_id=state.session_id)
+        adjust = (prev or {}).get("adjust")
+        return adjust if isinstance(adjust, dict) else {}
+
+    def _apply_adjust(self, state, adjust: dict) -> str:
+        """把反思调整插到本批路径最前（回补上次会话标记的薄弱点），返回给学生看的说明
+
+        只插入先修已达标（在 planner.frontier 内）的节点：反思挑中的薄弱点若前置
+        还没打牢，直接前插会把学生推到还啃不动的题上，此时改为在说明里讲清楚。
+        """
+        note = (adjust or {}).get("note") or ""
+        items = state.plan.get("items") or []
+        frontier = set(self.planner.frontier(state.profile))
+        picks, blocked = [], []
+        for nid in (adjust or {}).get("review_nodes") or []:
+            if nid not in self.kg.nodes:
+                continue
+            if any(i["node_id"] == nid for i in items):
+                continue
+            if nid not in frontier:
+                blocked.append(self.kg.nodes[nid].name)
+                continue
+            picks.append(self._make_item(state, nid, "复习",
+                                         reason="上次会话反思：先回补这个薄弱点"))
+        if picks:
+            state.plan["items"] = picks + items
+        if blocked:
+            note += "（" + "、".join(blocked) + " 的前置还没打牢，本批先补齐前置）"
+        return note
+
     def _new_batch(self, state, prefix=""):
         stuck = sum(1 for c in state.last_results if not c)
         params = pace_params((state.report or {}).get("accuracy"), stuck)
-        base = self.planner.plan(state.profile, batch=params["batch"])
+        adjust = self._pending_adjust(state)
+        # 反思给出的节奏调整落到本批参数上（D1：反思→下一次会话真正生效）
+        hint = adjust.get("pace_hint")
+        if hint == "slow":
+            params["pace"] = round(max(0.4, params["pace"] - 0.2), 2)
+            params["batch"] = max(1, params["batch"] - 1)
+        elif hint == "fast":
+            params["pace"] = round(min(1.6, params["pace"] + 0.2), 2)
+        base = self.planner.plan(state.profile, batch=params["batch"],
+                                 pace=params["pace"], review=self._review_urgency(state))
         state.plan = self._llm_order(state, base)
         state.plan_idx = 0
         state.current_node = ""
         state.current_question = None
         state.lecture_para = 0
+        note = self._apply_adjust(state, adjust)
         self.mem.save_plan(state.session_id, state.student_id, params["pace"],
                            state.plan["band"], state.plan)
         if not state.plan["items"]:
             return "你的知识点掌握得都很扎实，可以自由选择想学的内容。", self._payload(state)
         begin = self._begin_node(state, state.plan["items"][0])
-        return prefix + begin, self._payload(state)
+        head = f"🧠 智能体反思：{note}\n\n" if note else ""
+        return prefix + head + begin, self._payload(state)
 
     @staticmethod
     def _fast_call(fn, timeout=8.0):
@@ -777,7 +1235,8 @@ class Orchestrator:
                         "5. items 数量不超过候选数量。"},
             {"role": "user",
              "content": f"[stats_json={json.dumps(stats, ensure_ascii=False)}]\n"
-                        f"[candidates_json={json.dumps(candidates, ensure_ascii=False)}]"},
+                        f"[candidates_json={json.dumps(candidates, ensure_ascii=False)}]\n"
+                        f"[band_json={json.dumps(base.get('band', {}), ensure_ascii=False)}]"},
         ]
         result = self._fast_call(lambda: (llm or self.llm).chat_json(messages))
         if not isinstance(result, dict) or not result:
@@ -808,12 +1267,12 @@ class Orchestrator:
             plan["notes"] = str(result["notes"])
         return plan
 
-    def _make_item(self, state, node_id, tier):
+    def _make_item(self, state, node_id, tier, reason=None):
         node = self.kg.nodes[node_id]
         return {"node_id": node_id, "name": node.name, "score": 0.0, "tier": tier,
                 "difficulty": node.difficulty,
                 "mastery": round(state.profile.mastery.get(node_id, 0.0), 3),
-                "reason": "重规划：回补先修知识点"}
+                "reason": reason or "重规划：回补先修知识点"}
 
     # ==================== 会话结束 ====================
     def _end_session(self, state):
@@ -831,12 +1290,18 @@ class Orchestrator:
         return reply, self._payload(state)
 
     # ==================== 落库 ====================
-    def _log_attempt(self, state, q, correct, theta, node_id=None):
+    def _log_attempt(self, state, q, correct, theta, node_id=None, choice=None):
+        """写作答记录：content 仍用「✓/✗ + 题干前缀」（错题本据此匹配题目），
+        选项与正确答案另写入 payload，供历史对话页回显「你选 X，正确 Y」。
+        """
         node_id = node_id or state.current_node or \
             (state.quiz_state.current_node if state.quiz_state else "")
         self.mem.log_interaction(state.session_id, state.student_id, "quiz", node_id,
                                  f"{'✓' if correct else '✗'} {q.get('stem', '')[:50]}",
-                                 {"correct": correct, "theta": round(theta, 3)})
+                                 {"correct": correct, "theta": round(theta, 3),
+                                  "qid": q.get("id", ""),
+                                  "choice": (choice or "").upper(),
+                                  "answer": str(q.get("answer", "")).upper()})
         self.mem.snapshot_mastery(state.student_id, node_id, theta,
                                   state.profile.evidence_count[node_id])
 

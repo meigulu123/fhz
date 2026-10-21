@@ -35,6 +35,7 @@ def _quiz_to_dict(qs: QuizState | None) -> dict | None:
         "covered": sorted(qs.covered), "questions_asked": qs.questions_asked,
         "last_results": list(qs.last_results),
         "answers": [list(a) for a in qs.answers],
+        "skipped": sorted(qs.skipped),
         "finished": qs.finished, "stop_reason": qs.stop_reason,
         "goal_tags": list(qs.goal_tags),
     }
@@ -50,6 +51,7 @@ def _quiz_from_dict(d: dict | None) -> QuizState | None:
     qs.questions_asked = d["questions_asked"]
     qs.last_results = list(d.get("last_results", []))
     qs.answers = [tuple(a) for a in d.get("answers", [])]
+    qs.skipped = set(d.get("skipped", []))
     qs.finished = d["finished"]
     qs.stop_reason = d.get("stop_reason", "")
     qs.goal_tags = set(d.get("goal_tags", []))
@@ -69,6 +71,7 @@ class AgentState:
     current_node: str = ""
     lecture_para: int = 0
     current_question: dict | None = None   # 当前待答题目（或变式题）
+    reteach_para: int = -1                 # 已「重讲」过的讲义分段下标（-1 表示还没重讲过）
     scaffold: ScaffoldState = field(default_factory=ScaffoldState)
     last_results: list = field(default_factory=list)   # 近 8 次作答对错
     done_nodes: list = field(default_factory=list)
@@ -80,6 +83,7 @@ class AgentState:
     used_qids: list = field(default_factory=list)      # 本会话已出过的题目 id
     practice_node: str = ""                            # 自主练习目标节点（独立于 current_node）
     resume_phase: str = ""                             # 进入练习前的相位，退出时恢复
+    reflection_used: bool = False                      # 上次会话反思的结构化调整是否已落到本会话
     _milestones_done: set = field(default_factory=set)  # 已达成的里程碑 id 集合（不序列化）
 
     def to_dict(self) -> dict:
@@ -92,6 +96,7 @@ class AgentState:
             "plan": self.plan, "plan_idx": self.plan_idx,
             "current_node": self.current_node, "lecture_para": self.lecture_para,
             "current_question": self.current_question,
+            "reteach_para": self.reteach_para,
             "scaffold": sc,
             "last_results": list(self.last_results),
             "done_nodes": list(self.done_nodes),
@@ -102,6 +107,7 @@ class AgentState:
             "used_qids": list(self.used_qids),
             "practice_node": self.practice_node,
             "resume_phase": self.resume_phase,
+            "reflection_used": self.reflection_used,
         }
 
     @classmethod
@@ -116,6 +122,7 @@ class AgentState:
         state.current_node = d.get("current_node", "")
         state.lecture_para = d.get("lecture_para", 0)
         state.current_question = d.get("current_question")
+        state.reteach_para = d.get("reteach_para", -1)
         sc = ScaffoldState()
         sc.__dict__.update(d.get("scaffold", {}))
         state.scaffold = sc
@@ -129,6 +136,7 @@ class AgentState:
         state.used_qids = list(d.get("used_qids", []))
         state.practice_node = d.get("practice_node", "")
         state.resume_phase = d.get("resume_phase", "")
+        state.reflection_used = d.get("reflection_used", False)
         return state
 
     def reset_for_new_session(self):
@@ -141,6 +149,7 @@ class AgentState:
         self.current_node = ""
         self.lecture_para = 0
         self.current_question = None
+        self.reteach_para = -1
         self.scaffold.reset()
         self.last_results = []
         self.done_nodes = []

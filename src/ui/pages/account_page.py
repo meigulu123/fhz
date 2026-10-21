@@ -3,6 +3,7 @@ import time
 
 import streamlit as st
 
+from src.ui.components import logout
 from src.ui.theme import AVATAR_DIR, avatar_html, avatar_path
 
 
@@ -46,9 +47,9 @@ def _account_card(mem, username, state):
         if profile and profile.name:
             st.markdown(f"**学习档案**：{profile.name}"
                         + (f"（{profile.major}）" if profile.major else ""))
-        if st.button("退出登录", use_container_width=True, key="acct_logout"):
-            st.session_state["agent_state"] = None
-            st.session_state["login_pwd"] = ""
+        if st.button("退出登录", use_container_width=True, type="tertiary",
+                     key="acct_logout"):
+            logout()
             st.rerun()
 
 
@@ -102,6 +103,12 @@ def _stats_card(mem, username):
 def _password_card(mem, username):
     with st.container(border=True):
         st.subheader("修改密码")
+        # 修改成功后的复位：必须在输入框实例化之前写 session_state，
+        # 否则 Streamlit 抛 "cannot be modified after the widget is instantiated"
+        if st.session_state.pop("pwd_done", False):
+            for k in ("pwd_old", "pwd_new", "pwd_new2"):
+                st.session_state.pop(k, None)
+            st.success("密码已修改，下次登录请使用新密码")
         old = st.text_input("原密码", type="password", key="pwd_old")
         new = st.text_input("新密码", type="password", key="pwd_new",
                             placeholder="至少 4 位")
@@ -117,9 +124,8 @@ def _password_card(mem, username):
             elif not mem.change_password(username, old, new):
                 st.error("原密码不正确")
             else:
-                for k in ("pwd_old", "pwd_new", "pwd_new2"):
-                    st.session_state[k] = ""
-                st.success("密码已修改，下次登录请使用新密码")
+                st.session_state["pwd_done"] = True
+                st.rerun()
 
 
 def _danger_card(env, mem, username, state):

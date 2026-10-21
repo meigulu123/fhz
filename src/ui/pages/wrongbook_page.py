@@ -1,4 +1,4 @@
-"""错题本页：自动收集所有答错的题
+"""错题本页：自动收集所有答错的题 + 错因归类 + 一键组卷重练
 
 按题聚合：完整题干 / 选项 / 正确答案 / 解析 / 知识点 / 答错次数 / 最近时间。
 数据来源是每次测验落库的作答记录（含正确性标记），无需学生手动添加。
@@ -7,6 +7,12 @@ import time
 from collections import Counter
 
 import streamlit as st
+
+from src.student.error_cause import error_cause
+from src.ui.components import flash
+
+MAX_RETRY = 5          # 重练卷最多题数
+RETRY_KEYS = ("retry_paper", "retry_idx", "retry_answers", "retry_feedback")
 
 
 def wrongbook_page():
@@ -33,9 +39,22 @@ def wrongbook_page():
         g["count"] += 1
         g["last"] = max(g["last"], a["ts"])
     rows = sorted(grouped.values(), key=lambda g: g["last"], reverse=True)
+    for g in rows:
+        node = kg.nodes.get(g["q"].get("node_id"))
+        g["cause"], g["cause_hint"] = _error_cause(
+            g["q"], profile=state.profile, count=g["count"],
+            node_name=(node.name if node else ""))
 
-    # ===== 顶部统计概览 =====
+    # ===== 重练模式：优先渲染，聚焦答题 =====
+    if st.session_state.get("retry_paper"):
+        _retry_mode(env, state)
+        return
+
+    # ===== 顶部统计概览（含错因分布） =====
     _stats_overview(rows, kg)
+
+    # ===== 一键组卷重练 =====
+    _retry_bar(env, rows)
 
     # ===== 筛选栏 =====
     _filter_bar(rows, kg)
@@ -58,8 +77,8 @@ def wrongbook_page():
 
         with st.expander(
                 f"❌ {stem[:40]}{'…' if len(stem) > 40 else ''}　"
-                f"[{category}] 错 {g['count']} 次 · {last}"):
-            _question_card(q, node_name, g["count"])
+                f"[{category}] 错 {g['count']} 次 · {last} · {g['cause']}"):
+            _question_card(q, node_name, g["count"], g["cause"], g["cause_hint"])
 
 
 def _stats_overview(rows, kg):
@@ -95,6 +114,14 @@ def _stats_overview(rows, kg):
         for cat, cnt in cat_counts.most_common():
             pct = cnt / total * 100
             st.progress(cnt / total, text=f"{cat}: {cnt} 道 ({pct:.0f}%)")
+
+    # 错因分布图
+    cause_counts = Counter(g["cause"] for g in rows)
+    if cause_counts:
+        st.markdown("**错因分布**")
+        for cause, cnt in cause_counts.most_common():
+            pct = cnt / total * 100
+            st.progress(cnt / total, text=f"{cause}: {cnt} 道 ({pct:.0f}%)")
 
 
 def _filter_bar(rows, kg):
@@ -148,23 +175,18 @@ def _apply_filter(rows, kg):
     return filtered
 
 
-def _question_card(q, node_name, count):
-    """单个错题卡片"""
+def _question_card(q, node_name, count, cause, hint):
+    """单个错题卡片：题干 / 选项（标出正确项）/ 答案 / 解析 / 错因建议"""
     stem = (q.get("stem") or "").strip()
-
-    # 题目内容
     st.markdown(f"**📝 题目**：{stem}")
 
-    # 选项
-    opts = q.get("options") or {}
-    if opts:
-        for letter in "ABCD":
-            if letter in opts:
-                is_correct = letter == q.get("answer")
-                icon = " ✅" if is_correct else " ❌" if count > 0 else ""
-                st.markdown(f"{letter}. {opts[letter]}{icon}")
+    # options 是形如 ["A. 1", "B. 2", ...] 的列表
+    opts = q.get("options") or []
+    answer = str(q.get("answer") or "").strip().upper()
+    for opt in opts:
+        letter = str(opt).strip()[:1].upper()
+        st.markdown(f"- {opt}{' ✅' if letter == answer else ''}")
 
-    # 答案和解析
     c1, c2 = st.columns(2)
     with c1:
         st.markdown(f"**✅ 正确答案**：{q.get('answer', '—')}")
@@ -174,18 +196,22 @@ def _question_card(q, node_name, count):
     if q.get("explanation"):
         st.markdown(f"**💡 解析**：{q['explanation']}")
 
-    # 底部标签
-    st.caption(f"📊 答错 {count} 次 · 建议：重新练习这道题巩固知识点")
+    st.warning(f"⚠️ 错因：{cause}（累计答错 {count} 次）　建议：{hint}")
 
 
 def _match_question(env, content):
-    """用作答记录里的题干前缀匹配题库完整题目（含变式）"""
+    """用作答记录里的题干前缀匹配题库完整题目（含变式）
+
+    作答记录只存了题干前 50 字，故匹配需双向前缀：长题干用
+    stem.startswith(prefix)（记录是它的前缀），短题干用 prefix.startswith(stem)。
+    命中多个时取题干最长者，避免短题干误配。
+    """
     prefix = content[2:].strip() if content.startswith("✗ ") else content.strip()
     best = None
     for q in env["questions"]:
         for src in (q, q.get("variant") or {}):
             stem = (src.get("stem") or "").strip()
-            if len(stem) >= 8 and stem in prefix:
+            if len(stem) >= 8 and (stem.startswith(prefix) or prefix.startswith(stem)):
                 if best is None or len(stem) > len(best[2]):
                     display = dict(q)
                     for k, v in src.items():
@@ -193,3 +219,150 @@ def _match_question(env, content):
                             display[k] = v
                     best = (display, src.get("stem", ""), len(stem))
     return best[0] if best else None
+
+
+def _error_cause(q, profile, count, node_name=""):
+    """错因归类：走共享错因模块（与脚手架靶向干预同一口径）"""
+    return error_cause(q, profile, count, node_name)
+
+
+def _retry_bar(env, rows):
+    """一键组卷：把当前错题组成最多 MAX_RETRY 道的重练卷（优先变式题）"""
+    paper = _build_paper(env, rows)
+    c1, c2 = st.columns([0.62, 0.38], vertical_alignment="center")
+    with c1:
+        st.markdown(f"**🎯 一键组卷重练**：按错题自动生成 {len(paper)} 道练习"
+                    "（优先换一个问法，避免死记答案）")
+    with c2:
+        if st.button(f"✍️ 生成错题重练卷（最多 {MAX_RETRY} 题）", type="primary",
+                     use_container_width=True, key="retry_build"):
+            if not paper:
+                st.warning("暂无可用于重练的题目。")
+                return
+            _clear_retry()
+            st.session_state["retry_paper"] = paper
+            st.session_state["retry_idx"] = 0
+            st.session_state["retry_answers"] = []
+            flash(f"已生成 {len(paper)} 道错题重练卷，开始吧", icon="✍️")
+            st.rerun()
+
+
+def _build_paper(env, rows):
+    """生成重练卷：高频错题优先 + 优先变式题 + 题干去重 + 最多 MAX_RETRY 道
+
+    变式题与原题 id 相同但问法/选项不同，用它避免学生背答案。
+    """
+    by_id = {q.get("id"): q for q in env["questions"]}
+    paper, seen = [], set()
+    for g in sorted(rows, key=lambda g: (-g["count"], -g["last"])):
+        if len(paper) >= MAX_RETRY:
+            break
+        base = by_id.get(g["q"].get("id")) or g["q"]
+        item = dict(base)
+        for k, v in (base.get("variant") or {}).items():
+            if v:
+                item[k] = v
+        stem = item.get("stem")
+        if stem in seen:
+            continue
+        seen.add(stem)
+        paper.append(item)
+    return paper
+
+
+def _clear_retry():
+    """清理重练模式的所有会话状态"""
+    for k in RETRY_KEYS:
+        st.session_state.pop(k, None)
+
+
+def _retry_mode(env, state):
+    """重练模式：一次一题，答完即时判分 + 解析并逐题落库；末尾汇总得分"""
+    paper = st.session_state.get("retry_paper") or []
+    idx = st.session_state.get("retry_idx", 0)
+    answers = st.session_state.get("retry_answers") or []
+    fb = st.session_state.get("retry_feedback")
+
+    top1, top2 = st.columns([0.72, 0.28], vertical_alignment="center")
+    with top1:
+        st.markdown(f"#### ✍️ 错题重练　`{min(idx + 1, len(paper))} / {len(paper)}`")
+    with top2:
+        if st.button("← 退出重练", use_container_width=True, key="retry_exit"):
+            _clear_retry()
+            st.rerun()
+
+    if not paper:
+        st.info("重练卷为空，请回错题列表重新生成。")
+        _clear_retry()
+        return
+
+    if idx >= len(paper):
+        _retry_summary(paper, answers)
+        return
+
+    q = paper[idx]
+    st.progress(idx / len(paper), text=f"进度 {idx} / {len(paper)} 题")
+    st.markdown(f"**📝 {(q.get('stem') or '').strip()}**")
+    opts = q.get("options") or []
+    answer_letter = str(q.get("answer") or "").strip().upper()
+
+    if fb is None:
+        for opt in opts:
+            letter = str(opt).strip()[:1].upper()
+            if st.button(opt, use_container_width=True, key=f"retry_opt_{idx}_{letter}"):
+                correct = letter == answer_letter
+                env["orch"].log_practice(state, q, correct, letter)
+                answers.append({"letter": letter, "correct": correct})
+                st.session_state["retry_answers"] = answers
+                st.session_state["retry_feedback"] = {"choice": letter, "correct": correct}
+                st.rerun()
+    else:
+        choice = fb["choice"]
+        for opt in opts:
+            letter = str(opt).strip()[:1].upper()
+            mark = " ✅" if letter == answer_letter else (" ❌" if letter == choice else "")
+            st.markdown(f"- {opt}{mark}")
+        if fb["correct"]:
+            st.success(f"答对了！正确答案：{q.get('answer')}")
+        else:
+            st.error(f"答错了。你的选择 {choice}，正确答案 {q.get('answer')}")
+        if q.get("explanation"):
+            st.info(f"💡 解析：{q['explanation']}")
+        last = idx + 1 >= len(paper)
+        if st.button("查看结果 →" if last else "下一题 →", type="primary",
+                     use_container_width=True, key="retry_next"):
+            st.session_state["retry_idx"] = idx + 1
+            st.session_state.pop("retry_feedback", None)
+            st.rerun()
+
+
+def _retry_summary(paper, answers):
+    """重练结束：统计答对/答错数量，提供再练一次或返回列表"""
+    total = len(paper)
+    correct = sum(1 for a in answers if a.get("correct"))
+    wrong = total - correct
+    st.markdown("#### 🎯 重练结果")
+    c1, c2, c3 = st.columns(3)
+    c1.metric("共练题数", f"{total} 题")
+    c2.metric("答对", f"{correct} 道")
+    c3.metric("答错", f"{wrong} 道")
+    if total:
+        st.progress(correct / total, text=f"正确率 {correct / total * 100:.0f}%")
+    if wrong == 0:
+        st.success("🎉 全部答对，这套错题已经拿下！")
+    else:
+        st.info(f"还有 {wrong} 道没拿下，可以再练一次，或回错题列表看解析。")
+
+    b1, b2 = st.columns(2)
+    with b1:
+        if st.button("🔁 再练一次", type="primary", use_container_width=True,
+                     key="retry_again"):
+            st.session_state["retry_idx"] = 0
+            st.session_state["retry_answers"] = []
+            st.session_state.pop("retry_feedback", None)
+            flash("已重置重练卷，再来一遍", icon="🔁")
+            st.rerun()
+    with b2:
+        if st.button("返回错题列表", use_container_width=True, key="retry_back"):
+            _clear_retry()
+            st.rerun()

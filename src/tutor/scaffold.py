@@ -9,6 +9,8 @@ L3 变式仍错 → 触发重规划。
 """
 from dataclasses import dataclass, field
 
+from src.student.error_cause import cause_note
+
 LEVELS = ["L0", "L1", "L2", "L3"]
 CONFUSION_WORDS = ["不会", "不懂", "卡住", "太难", "怎么办", "怎么做", "帮帮我",
                    "求助", "想不出来", "看不懂", "help"]
@@ -24,6 +26,7 @@ class ScaffoldState:
     help_streak: int = 0         # 连续求助次数
     last3: list = field(default_factory=list)   # 近 3 题对错
     variant_tried: bool = False  # L3 变式题是否已做过
+    cause: str = ""              # 本次干预的错因标签（靶向提示用）
 
     def reset(self):
         self.active = False
@@ -34,6 +37,7 @@ class ScaffoldState:
         self.help_streak = 0
         self.last3 = []
         self.variant_tried = False
+        self.cause = ""
 
 
 def detect_stuck(state: ScaffoldState, intent: str, text: str,
@@ -61,12 +65,14 @@ class Scaffolder:
         self.qbank = {q["id"]: q for q in questions or []}
         self.mem = mem
 
-    def engage(self, state: ScaffoldState, question_id: str, node_id: str) -> dict:
-        """首次卡住：进入 L0"""
+    def engage(self, state: ScaffoldState, question_id: str, node_id: str,
+               cause: str = "", start_level: int = 0) -> dict:
+        """首次卡住：进入 L0；该生在该节点的历史退出层级较高时可从 L1 起步"""
         state.active = True
-        state.level = 0
+        state.level = max(0, min(int(start_level), 2))
         state.question_id = question_id
         state.node_id = node_id
+        state.cause = cause or ""
         state.wrong_streak = 0
         state.help_streak = 0
         state.variant_tried = False
@@ -77,6 +83,8 @@ class Scaffolder:
         level = LEVELS[state.level]
         q = self.qbank.get(state.question_id, {})
         user = f"[question_id={state.question_id}][level={level}]"
+        if state.cause:
+            user += f"[cause={state.cause}]"
         if q:
             opts = "\n".join(q.get("options", []))
             user += f"\n【题目原文】\n{q.get('stem', '')}\n{opts}\n"
@@ -84,6 +92,8 @@ class Scaffolder:
             if hint_text:
                 user += (f"\n【本题{level}参考提示，请在此基础上引导，"
                          f"不超范围、不公布答案】\n{hint_text}\n")
+        if state.cause:
+            user += f"\n【错因】{cause_note(state.cause)}\n"
         messages = [
             {"role": "system", "content": "[TPL:scaffold]\n你是伴学导师，进行脚手架式辅导，"
                                           "按层级给学生提示，不直接给答案；"

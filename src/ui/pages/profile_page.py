@@ -13,11 +13,14 @@ import time
 
 import streamlit as st
 
-from src.student.diagnosis import gen_profile_report, profile_metrics
+from src.student.diagnosis import (confidence_summary, gen_profile_report,
+                                   node_confidence, proficiency, profile_metrics)
+from src.student.profile import is_untested
 from src.ui.components import (ability_figure, accuracy_pie_figure,
                                bloom_figure, duration_bar_figure,
-                               mastery_share_figure, radar_figure,
-                               trend_figure, zpd_figure)
+                               growth_figure, mastery_share_figure,
+                               radar_figure, trend_figure, zpd_figure)
+from src.ui.report_export import build_html_report
 
 # 诊断报告缓存键：student_id -> {"fp": 指标指纹, "text": 报告}
 _REPORT_CACHE = "profile_report_cache"
@@ -28,7 +31,7 @@ def profile_page():
     env = st.session_state["env"]
     state = st.session_state.get("agent_state")
     if state is None or state.profile is None:
-        st.info("请先登录并开始学习，画像页将展示学情数据。")
+        st.info("先登录并完成一次学情诊断，这里会展示你的掌握情况、成长曲线与诊断报告。")
         return
     kg, mem = env["kg"], env["mem"]
 
@@ -64,6 +67,9 @@ def profile_page():
         f'<div class="cb-right">知途伴学 · 学习数据看板</div></div>',
         unsafe_allow_html=True)
 
+    # ---- 首屏一句话学情：先告诉学生「现在什么情况、下一步做什么」 ----
+    _situation_summary(kg, profile, qs)
+
     # ---- 能力概览：六维雷达 + 三档占比 + 核心能力分 ----
     st.markdown('<div class="section-title">能力概览</div>',
                 unsafe_allow_html=True)
@@ -76,97 +82,144 @@ def profile_page():
     with c3:
         _ability_scores(kg, profile, qs)
 
-    # ---- 学习数据概览：4 指标卡（hover 动效） ----
+    # ---- 学习数据概览：5 指标卡（hover 动效） ----
     st.markdown('<div class="section-title">学习数据概览</div>',
                 unsafe_allow_html=True)
-    m1, m2, m3, m4 = st.columns(4)
+    m1, m2, m3, m4, m5 = st.columns(5)
     acc = qs["correct"] / qs["total"] if qs["total"] else 0.0
+    total_dur = mem.total_duration(profile.student_id)
+    avg_sec = total_dur / qs["total"] if qs["total"] else None
+    prof = proficiency(acc, avg_sec)
     for col, label, value, hint in (
         (m1, "总做题数", f"{qs['total']} 题", "全部测验作答"),
         (m2, "错题数", f"{qs['wrong']} 题", "自动汇入错题本"),
         (m3, "正确率", f"{acc * 100:.0f}%", "答对题数 / 总做题数"),
-        (m4, "总学习时长", _fmt_duration(mem.total_duration(profile.student_id)),
-         "全部会话累计"),
+        (m4, "熟练度", f"{prof * 100:.0f}%",
+         "正确率 × 速度系数：平均每题 ≤40 秒算熟练，越慢系数越低"),
+        (m5, "总学习时长", _fmt_duration(total_dur), "全部会话累计"),
     ):
         with col:
             with st.container(border=True, key=f"profile_metric_{label}"):
                 st.metric(label, value, help=hint)
 
-    # ---- 学习分析 2×2：时长 / 正确率 / ZPD / 布鲁姆 ----
-    st.markdown('<div class="section-title">学习分析</div>',
-                unsafe_allow_html=True)
-    a1, a2 = st.columns(2)
-    with a1:
-        st.plotly_chart(
-            duration_bar_figure(mem.duration_by_day(profile.student_id)),
-            use_container_width=True)
-    with a2:
-        st.plotly_chart(accuracy_pie_figure(qs["correct"], qs["wrong"]),
-                        use_container_width=True)
-    a3, a4 = st.columns(2)
-    with a3:
-        band = state.report.get("band") or env["planner"].zpd_band(profile)
-        st.plotly_chart(zpd_figure(kg, profile, band), use_container_width=True)
-    with a4:
-        st.plotly_chart(bloom_figure(kg, profile), use_container_width=True)
+    # ---- 学习分析 2×2：时长 / 正确率 / ZPD / 布鲁姆（折起，首屏更清爽）----
+    with st.expander("📊 学习分析（时长 / 正确率 / 最近发展区 / 认知层级）"):
+        a1, a2 = st.columns(2)
+        with a1:
+            st.plotly_chart(
+                duration_bar_figure(mem.duration_by_day(profile.student_id)),
+                use_container_width=True)
+        with a2:
+            st.plotly_chart(accuracy_pie_figure(qs["correct"], qs["wrong"]),
+                            use_container_width=True)
+        a3, a4 = st.columns(2)
+        with a3:
+            band = state.report.get("band") or env["planner"].zpd_band(profile)
+            st.plotly_chart(zpd_figure(kg, profile, band), use_container_width=True)
+        with a4:
+            st.plotly_chart(bloom_figure(kg, profile), use_container_width=True)
 
-    # ---- 知识点掌握度：七类雷达 + 详情表（排序/状态色） ----
-    st.markdown('<div class="section-title">知识点掌握度</div>',
-                unsafe_allow_html=True)
-    k1, k2 = st.columns([1, 1.35])
-    with k1:
-        st.plotly_chart(radar_figure(kg, profile), use_container_width=True)
-    with k2:
-        _mastery_table(kg, profile)
+    # ---- 知识点掌握度：七类雷达 + 详情表（折起）----
+    with st.expander("🎯 知识点掌握度（七类雷达 + 逐点明细）"):
+        k1, k2 = st.columns([1, 1.35])
+        with k1:
+            st.plotly_chart(radar_figure(kg, profile), use_container_width=True)
+        with k2:
+            _mastery_table(kg, profile)
 
-    # ---- 基本信息与 AI 学情诊断 ----
+    # ---- 基本信息与 AI 学情诊断（折起）----
+    with st.expander("🧾 基本信息与 AI 诊断报告"):
+        b1, b2 = st.columns([0.9, 1.6])
+        with b1:
+            st.markdown(f"**姓名**：{profile.name}　**专业**：{profile.major or '—'}")
+            st.markdown(f"**学习目标**：{'、'.join(profile.goals) if profile.goals else '—'}")
+            if profile.style_tags:
+                st.markdown(f"**风格标签**：{'、'.join(profile.style_tags)}")
+            if profile.needs_review:
+                st.markdown("**待复习**：" + "、".join(
+                    kg.nodes[n].name for n in list(profile.needs_review)[:6]))
+            r = state.report
+            if r:
+                st.markdown(f"**诊断覆盖**：{r['covered']} 节点 / "
+                            f"{r['total_questions']} 题，正确率 {r['accuracy']}（{r['stop_reason']}）")
+        with b2:
+            _ai_diagnosis(env, kg, profile, band)
+
+    # ---- 大模型观察记录：画像随对话持续生长的证据（折起）----
+    with st.expander("🔍 大模型观察记录"):
+        obs = mem.list_observations(profile.student_id)
+        if obs:
+            for o in obs:
+                c = o["content"]
+                parts = []
+                if c.get("style_tags_add"):
+                    parts.append("新增标签：" + "、".join(c["style_tags_add"]))
+                if c.get("goals_update"):
+                    parts.append("目标更新为：" + c["goals_update"])
+                if c.get("observation"):
+                    parts.append(c["observation"])
+                when = time.strftime("%m-%d %H:%M", time.localtime(o["ts"]))
+                why = "会话结束" if o["reason"] == "session_end" else "空闲跟进"
+                st.caption(f"{when} · {why}：{'；'.join(parts)}")
+        else:
+            st.caption("暂无观察记录。结束一次会话、或离开超过 5 分钟后再回来，"
+                       "大模型会根据对话内容在这里持续更新你的画像。")
+
+    # ---- 成长曲线 + 掌握度变化趋势 ----
     st.divider()
-    st.subheader("基本信息与诊断报告")
-    b1, b2 = st.columns([0.9, 1.6])
-    with b1:
-        st.markdown(f"**姓名**：{profile.name}　**专业**：{profile.major or '—'}")
-        st.markdown(f"**学习目标**：{'、'.join(profile.goals) if profile.goals else '—'}")
-        if profile.style_tags:
-            st.markdown(f"**风格标签**：{'、'.join(profile.style_tags)}")
-        if profile.needs_review:
-            st.markdown("**待复习**：" + "、".join(
-                kg.nodes[n].name for n in list(profile.needs_review)[:6]))
-        r = state.report
-        if r:
-            st.markdown(f"**诊断覆盖**：{r['covered']} 节点 / "
-                        f"{r['total_questions']} 题，正确率 {r['accuracy']}（{r['stop_reason']}）")
-    with b2:
-        _ai_diagnosis(env, kg, profile, band)
-
-    # ---- 大模型观察记录：画像随对话持续生长的证据 ----
-    st.divider()
-    st.subheader("大模型观察记录")
-    obs = mem.list_observations(profile.student_id)
-    if obs:
-        for o in obs:
-            c = o["content"]
-            parts = []
-            if c.get("style_tags_add"):
-                parts.append("新增标签：" + "、".join(c["style_tags_add"]))
-            if c.get("goals_update"):
-                parts.append("目标更新为：" + c["goals_update"])
-            if c.get("observation"):
-                parts.append(c["observation"])
-            when = time.strftime("%m-%d %H:%M", time.localtime(o["ts"]))
-            why = "会话结束" if o["reason"] == "session_end" else "空闲跟进"
-            st.caption(f"{when} · {why}：{'；'.join(parts)}")
+    st.subheader("成长曲线")
+    growth = mem.mastery_growth(profile.student_id)
+    if growth:
+        g1, g2 = st.columns([1.7, 1])
+        with g1:
+            st.plotly_chart(growth_figure(growth), use_container_width=True)
+        with g2:
+            first, last = growth[0], growth[-1]
+            st.metric("已接触知识点", f"{last['nodes']} 个")
+            st.metric("已掌握知识点",
+                      f"{last['mastered']} 个", delta=last["mastered"] - first["mastered"])
+            st.metric("平均掌握度 θ", f"{last['mean']:.3f}",
+                      delta=round(last["mean"] - first["mean"], 3))
+            st.caption(f"统计口径：按自然日重放掌握度快照，取每天「已接触知识点」"
+                       f"的平均 θ 与 θ≥0.75 的知识点个数；共 {len(growth)} 天记录。")
     else:
-        st.caption("暂无观察记录。结束一次会话、或离开超过 5 分钟后再回来，"
-                   "大模型会根据对话内容在这里持续更新你的画像。")
-
-    # ---- 掌握度变化趋势 ----
-    st.divider()
-    st.subheader("掌握度变化趋势（掌握度快照）")
+        st.caption("完成几次作答后，这里会展示你的成长曲线。")
     history = mem.snapshot_history(profile.student_id)
-    if history:
-        st.plotly_chart(trend_figure(kg, history), use_container_width=True)
+    with st.expander("📈 各知识点掌握度变化趋势（掌握度快照）"):
+        if history:
+            st.plotly_chart(trend_figure(kg, history), use_container_width=True)
+        else:
+            st.caption("完成几次作答后，这里会展示各知识点掌握度随时间的演变曲线。")
+
+    # ---- 导出学习报告（自包含 HTML，可打印为 PDF / 离线打开）----
+    st.divider()
+    st.download_button(
+        "⬇ 导出学习报告（HTML）", data=build_html_report(env, kg, profile, state),
+        file_name=f"{profile.name or 'student'}_学习报告.html",
+        mime="text/html",
+        help="自包含 HTML 报告（图表已内嵌，离线可打开）；"
+             "浏览器中 Ctrl+P 即可打印/另存为 PDF")
+
+
+def _situation_summary(kg, profile, qs):
+    """首屏一句话学情：先说清「现在什么情况、下一步做什么」，细节再往下翻
+
+    用未测节点口径统计，避免把「还没测过」的知识点算进「学习中」。
+    """
+    tested = [nid for nid in kg.nodes if not is_untested(profile, nid)]
+    mastered = sum(1 for nid in tested if profile.mastery.get(nid, 0.0) >= 0.75)
+    review = [kg.nodes[n].name for n in list(profile.needs_review)[:3] if n in kg.nodes]
+    if not tested:
+        next_step = "先完成学情摸底测验，我才能按你的真实水平排出专属学习路径。"
+    elif mastered >= max(len(kg.nodes) * 0.6, 3):
+        next_step = "掌握情况不错，可以去学习路径里挑战更进阶的知识点了。"
     else:
-        st.caption("完成几次作答后，这里会展示各知识点掌握度随时间的演变曲线。")
+        next_step = ("建议从「学习路径」里的下一个知识点继续；"
+                     "中途卡住就说一句「我不会」，我带你一步步想。")
+    with st.container(border=True):
+        st.markdown(f"**📌 一句话学情**：已测 {len(tested)} 个知识点，"
+                    f"其中已掌握 {mastered} 个；做题正确 {qs['correct']}/{qs['total']}。")
+        st.caption(f"待复习：{'、'.join(review) or '暂无'}　｜　下一步：{next_step}")
 
 
 def _ai_diagnosis(env, kg, profile, band):
@@ -174,8 +227,8 @@ def _ai_diagnosis(env, kg, profile, band):
     has_data = any(v > 0.05 for v in profile.mastery.values()) or \
         env["mem"].quiz_stats(profile.student_id)["total"] > 0
     if not has_data:
-        st.info("暂无学习数据。完成学情诊断测验后，这里会自动生成"
-                "你的优势、薄弱点与学习建议。")
+        st.info("还没有学习数据——做完学情摸底测验后，"
+                "我会在这里给出你的优势、薄弱点与下一步学习建议。")
         return
     m = profile_metrics(profile, kg, env["mem"])
     m["zpd"] = {"z_low": round(band.get("z_low", 0), 3),
@@ -211,14 +264,24 @@ def _ability_scores(kg, profile, qs):
 
 
 def _mastery_table(kg, profile):
-    """知识点掌握度详情表：默认按掌握度降序，进度条+状态标签着色"""
+    """知识点掌握度详情表：默认按掌握度降序，附诊断置信度（证据越少/越接近 0.5 越低）"""
     rows = []
     for nid, node in kg.nodes.items():
         th = profile.mastery.get(nid, 0.0)
-        status = "已掌握" if th >= 0.75 else ("学习中" if th > 0.05 else "未开始")
-        icon = {"已掌握": "🟢", "学习中": "🔵", "未开始": "⚪"}[status]
+        if is_untested(profile, nid):
+            status = "未测"
+        elif th >= 0.75:
+            status = "已掌握"
+        elif th > 0.05:
+            status = "学习中"
+        else:
+            status = "未开始"
+        icon = {"已掌握": "🟢", "学习中": "🔵", "未测": "⚫", "未开始": "⚪"}[status]
+        c = node_confidence(profile, nid)
+        conf = "🟢 高" if c >= 60 else ("🟡 中" if c >= 40 else "🔴 低")
         rows.append({"知识点": node.name, "类别": node.category,
-                     "掌握度": round(th, 3), "状态": f"{icon} {status}"})
+                     "掌握度": round(th, 3), "状态": f"{icon} {status}",
+                     "诊断置信度": f"{conf} {c}%"})
     rows.sort(key=lambda row: -row["掌握度"])
     st.dataframe(
         rows, use_container_width=True, hide_index=True,
@@ -227,6 +290,10 @@ def _mastery_table(kg, profile):
                 "掌握度", min_value=0.0, max_value=1.0, format="%.3f"),
         },
         height=430)
+    low = confidence_summary(profile, kg)["low_names"]
+    if low:
+        st.caption("🔴 以下知识点作答证据不足或掌握度贴近 0.5，结论待确认（建议补测）："
+                   + "、".join(low))
 
 
 def _fmt_duration(sec):

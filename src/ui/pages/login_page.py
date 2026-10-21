@@ -9,8 +9,9 @@ DEMO_PASSWORD = "demo"
 
 
 def login_page(env):
-    left, right = st.columns([1.05, 0.95], gap="large",
-                             vertical_alignment="center")
+    # 不用 vertical_alignment="center"：居中会让矮视口下右侧登录卡被顶到屏幕外，
+    # 按钮看不见；改为顶部对齐，卡片始终从页面上方开始渲染。
+    left, right = st.columns([1.05, 0.95], gap="large")
     with left:
         _brand_panel()
     with right:
@@ -86,6 +87,10 @@ def _login_view(env):
             st.rerun()
         else:
             st.error("账户或密码错误")
+    st.markdown('<p style="text-align:center; color:#8ea3c0; font-size:13px;'
+                ' margin:0 0 10px 0;">首次体验可点「演示账号」直接进入，'
+                '首页可挑选演示角色体验</p>',
+                unsafe_allow_html=True)
     c1, c2 = st.columns([1, 1])
     with c1:
         if st.button("演示账号", use_container_width=True):
@@ -93,12 +98,13 @@ def _login_view(env):
             if not mem.account_exists(DEMO_USER):
                 mem.create_account(DEMO_USER, DEMO_PASSWORD)
             st.session_state["agent_state"] = _make_state(env, DEMO_USER)
+            st.session_state["onboarding_seen"] = False
             st.rerun()
     with c2:
         if st.button("注册新账号", use_container_width=True):
             st.session_state["auth_view"] = "register"
             st.rerun()
-    st.caption(f"演示账号：{DEMO_USER} / {DEMO_PASSWORD}（也可直接点上方「演示账号」进入）")
+    st.caption(f"演示账号：{DEMO_USER} / {DEMO_PASSWORD}（也可直接点上方按钮进入）")
 
 
 def _register_view(env):

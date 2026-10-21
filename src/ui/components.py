@@ -7,7 +7,8 @@ import networkx as nx
 import plotly.graph_objects as go
 import streamlit as st
 
-from src.student.profile import BLOOM_LABELS, cognitive_profile
+from src.student.diagnosis import effort_score
+from src.student.profile import BLOOM_LABELS, cognitive_profile, is_untested
 
 CATEGORY_ORDER = ["数学基础", "ML概论", "经典监督学习", "集成学习",
                   "神经网络深度学习", "评估调优", "无监督学习"]
@@ -19,6 +20,29 @@ _GRID = "rgba(120, 190, 255, 0.13)"
 _ACCENT = "#22d3ee"
 
 
+def flash(msg: str, icon: str = "✅"):
+    """记录一条待弹出的提示：跨 st.rerun 存活，在目标页渲染时弹出"""
+    st.session_state.setdefault("_flash", []).append((msg, icon))
+
+
+def render_flash():
+    """在每个登录后页面顶部调用：弹出并清空待显示提示（st.toast）"""
+    for msg, icon in st.session_state.pop("_flash", []) or []:
+        st.toast(msg, icon=icon)
+
+
+def logout():
+    """退出登录：清空会话状态与页面级残留（侧边栏 / 账户页两个入口共用同一口径）
+
+    有 key 的组件会记住上一个账户的选择，不清理会导致新账户登录后
+    画像页仍显示上一个学生的数据。
+    """
+    st.session_state["agent_state"] = None
+    st.session_state["login_pwd"] = ""      # 清掉密码框残留
+    for k in ("profile_student", "profile_report_cache"):
+        st.session_state.pop(k, None)
+
+
 def dark(fig):
     """统一深色图表风格：透明底 + 青蓝网格 + 浅色文字（与玻璃卡片融合）
 
@@ -26,16 +50,16 @@ def dark(fig):
     title 对象会把它渲染成字符串 "undefined"。
     """
     axis_style = dict(gridcolor=_GRID, zerolinecolor=_GRID, linecolor=_GRID,
-                      tickfont=dict(color="#8ea3c0", size=11))
+                      tickfont=dict(color="#a9c0dc", size=13))
     fig.update_layout(
         paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-        font=dict(color=_INK, size=12),
+        font=dict(color=_INK, size=13),
         xaxis=dict(axis_style), yaxis=dict(axis_style),
-        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color=_INK, size=11)),
+        legend=dict(bgcolor="rgba(0,0,0,0)", font=dict(color=_INK, size=12)),
     )
     if fig.layout.title and fig.layout.title.text:
-        fig.update_layout(title=dict(font=dict(color="#dbe9fb", size=14)))
-    axis_title_font = dict(color="#a9c0dc", size=12)
+        fig.update_layout(title=dict(font=dict(color="#dbe9fb", size=16)))
+    axis_title_font = dict(color="#bfd3ec", size=13)
     for axis_name in ("xaxis", "yaxis"):
         axis = getattr(fig.layout, axis_name, None)
         if axis is not None and axis.title and axis.title.text:
@@ -45,15 +69,15 @@ def dark(fig):
         if getattr(trace, "marker", None) is not None \
                 and getattr(trace.marker, "showscale", False):
             trace.marker.colorbar = dict(
-                tickfont=dict(color="#8ea3c0"), outlinewidth=0, thickness=12,
-                title=dict(font=dict(color="#8ea3c0")))
+                tickfont=dict(color="#a9c0dc", size=13), outlinewidth=0, thickness=12,
+                title=dict(font=dict(color="#a9c0dc")))
     if fig.layout.polar is not None:
         fig.update_polars(
             bgcolor="rgba(255,255,255,0.03)",
             radialaxis=dict(gridcolor=_GRID, linecolor=_GRID,
-                            tickfont=dict(color="#8ea3c0")),
+                            tickfont=dict(color="#a9c0dc", size=13)),
             angularaxis=dict(gridcolor=_GRID, linecolor=_GRID,
-                             tickfont=dict(color=_INK)),
+                             tickfont=dict(color=_INK, size=13)),
         )
     return fig
 
@@ -76,11 +100,13 @@ def _band_name(x, band) -> str:
 
 
 def category_averages(kg, profile) -> dict:
-    """七个知识类别的平均掌握度"""
+    """七个知识类别的平均掌握度（只统计已测节点，未测节点不计入，避免虚高）"""
     cats = {}
     for nid, node in kg.nodes.items():
+        if is_untested(profile, nid):
+            continue
         cats.setdefault(node.category, []).append(profile.mastery.get(nid, 0.0))
-    return {c: round(statistics.mean(v), 3) for c, v in cats.items()}
+    return {c: round(statistics.mean(v), 3) for c, v in cats.items() if v}
 
 
 def mastery_bar(theta):
@@ -164,13 +190,12 @@ def bloom_figure(kg, profile) -> go.Figure:
     return dark(fig)
 
 
-def ability_figure(env, state) -> go.Figure:
-    """六维学习能力雷达（0~100）：学习进度/知识掌握/逻辑理解/答题正确率/记忆巩固/学习投入"""
+def ability_raw(env, state):
+    """六维学习能力原始值（0~1，顺序固定）——雷达图与「画像更新」卡共用同一口径"""
     profile, kg, mem = state.profile, env["kg"], env["mem"]
     mastery = profile.mastery
     total_nodes = max(len(kg.nodes), 1)
     mastered = sum(1 for v in mastery.values() if v >= 0.75)
-    progress = mastered / total_nodes
     knowledge = sum(mastery.values()) / max(len(mastery), 1)
     # 逻辑理解：布鲁姆 4~6 层节点的平均掌握度（体现理解/分析/评价能力）
     high = [v for nid, v in mastery.items()
@@ -178,44 +203,63 @@ def ability_figure(env, state) -> go.Figure:
     logic = sum(high) / len(high) if high else 0.0
     qs = mem.quiz_stats(profile.student_id)
     accuracy = qs["correct"] / qs["total"] if qs["total"] else 0.0
-    # 记忆巩固：已掌握节点的练习证据充分度（8 次练习算满）
-    ev = [min(1.0, profile.evidence_count.get(nid, 0) / 8)
+    # 记忆巩固：已掌握节点的「答对」证据充分度（每节点 8 次答对算满）——答错不计入
+    hits = mem.correct_by_node(profile.student_id)
+    ev = [min(1.0, hits.get(nid, 0) / 8)
           for nid, v in mastery.items() if v >= 0.75]
     retention = sum(ev) / len(ev) if ev else 0.0
-    # 学习投入：累计学习时长（10 小时算满）
-    effort = min(1.0, mem.total_duration(profile.student_id) / 36000)
+    # 学习投入：答对题数（60 道答对算满）——与其余五维同口径，只认答对
+    effort = effort_score(mem, profile.student_id)
     dims = ["学习进度", "知识掌握", "逻辑理解", "答题正确率", "记忆巩固", "学习投入"]
-    vals = [progress, knowledge, logic, accuracy, retention, effort]
-    defs = [
-        "已掌握知识点 / 全部知识点 × 100",
-        "全部知识点 BKT 掌握度 θ 的均值 × 100",
-        "布鲁姆 4~6 层（分析/评价/创造）节点的掌握度均值 × 100",
-        "答对题数 / 总做题数 × 100",
-        "已掌握节点的练习证据饱和率（每节点 8 次练习满格）× 100",
-        "累计学习时长 / 10 小时（封顶）× 100",
-    ]
+    return dims, [mastered / total_nodes, knowledge, logic, accuracy, retention, effort]
+
+
+ABILITY_DEFS = [
+    "已掌握知识点 / 全部知识点 × 100",
+    "全部知识点 BKT 掌握度 θ 的均值 × 100",
+    "布鲁姆 4~6 层（分析/评价/创造）节点的掌握度均值 × 100",
+    "答对题数 / 总做题数 × 100",
+    "已掌握节点的练习证据饱和率（每节点 8 次练习满格）× 100",
+    "累计学习时长 / 10 小时（封顶）× 100",
+]
+
+
+def ability_figure(env, state, height: int = 360) -> go.Figure:
+    """六维学习能力雷达（0~100）：学习进度/知识掌握/逻辑理解/答题正确率/记忆巩固/学习投入"""
+    dims, vals = ability_raw(env, state)
     fig = go.Figure(go.Scatterpolar(
         r=[v * 100 for v in vals] + [vals[0] * 100],
         theta=dims + [dims[0]], fill="toself", name="能力值",
-        customdata=defs + [defs[0]],
+        customdata=ABILITY_DEFS + [ABILITY_DEFS[0]],
         hovertemplate="<b>%{theta}</b>：%{r:.0f} 分<br>%{customdata}<extra></extra>",
         line=dict(color=_ACCENT, width=2), fillcolor="rgba(34,211,238,0.22)"))
     fig.update_layout(
         polar=dict(radialaxis=dict(range=[0, 100], tickvals=[25, 50, 75, 100])),
-        height=360, margin=dict(l=70, r=70, t=46, b=30), title="六维学习能力")
-    if not any(vals) and qs["total"] == 0:
-        _empty_note(fig)
+        height=height, margin=dict(l=70, r=70, t=46, b=30), title="六维学习能力")
     return dark(fig)
 
 
+def ability_live_card(env, state):
+    """「学习画像」卡：六维能力雷达（不标注增减，由学生自己观察变化）"""
+    with st.container(border=True):
+        st.markdown("**📈 学习画像**")
+        st.plotly_chart(ability_figure(env, state, height=260),
+                        use_container_width=True)
+
+
 def mastery_share_figure(kg, profile) -> go.Figure:
-    """三档掌握度占比环形图：已掌握 / 学习中 / 未开始"""
-    mastered = sum(1 for v in profile.mastery.values() if v >= 0.75)
-    learning = sum(1 for v in profile.mastery.values() if 0.05 < v < 0.75)
-    fresh = max(len(kg.nodes) - mastered - learning, 0)
+    """三档掌握度占比环形图：已掌握 / 学习中 / 未测（未测=无证据且未自述）"""
+    mastered = learning = untested = 0
+    for nid in kg.nodes:
+        if is_untested(profile, nid):
+            untested += 1
+        elif profile.mastery.get(nid, 0.0) >= 0.75:
+            mastered += 1
+        else:
+            learning += 1
     fig = go.Figure(go.Pie(
-        labels=["已掌握", "学习中", "未开始"],
-        values=[mastered, learning, fresh], hole=0.62, sort=False,
+        labels=["已掌握", "学习中", "未测"],
+        values=[mastered, learning, untested], hole=0.62, sort=False,
         marker=dict(colors=["#34d399", "#22d3ee", "#475569"]),
         textinfo="value",
         hovertemplate="<b>%{label}</b>：%{value} 个知识点（%{percent}）"
@@ -223,6 +267,24 @@ def mastery_share_figure(kg, profile) -> go.Figure:
     fig.update_layout(height=360, margin=dict(l=20, r=20, t=46, b=20),
                       title="掌握度三档占比", showlegend=True,
                       legend=dict(orientation="h", y=-0.05))
+    return dark(fig)
+
+
+def progress_ring_figure(done: int, total: int, label: str = "路径完成度") -> go.Figure:
+    """学习进度环形图：已完成 / 未完成，标题带完成百分比"""
+    total = max(int(total), 0)
+    done = max(min(int(done), total), 0)
+    pct = round(done / total * 100) if total else 0
+    fig = go.Figure(go.Pie(
+        labels=["已完成", "未完成"], values=[done, max(total - done, 0)],
+        hole=0.68, sort=False, marker=dict(colors=["#22d3ee", "#334155"]),
+        textinfo="none",
+        hovertemplate="<b>%{label}</b>：%{value} 个知识点<extra></extra>"))
+    fig.update_layout(height=300, margin=dict(l=20, r=20, t=52, b=10),
+                      title=f"{label} {pct}%", showlegend=True,
+                      legend=dict(orientation="h", y=-0.08))
+    if total == 0:
+        _empty_note(fig, "还没有学习进度数据")
     return dark(fig)
 
 
@@ -261,6 +323,35 @@ def duration_bar_figure(daily: list) -> go.Figure:
     return dark(fig)
 
 
+def growth_figure(rows: list) -> go.Figure:
+    """成长曲线：按天聚合的平均掌握度（折线，左轴）+ 已掌握知识点数（柱，右轴）
+
+    rows 来自 MemoryStore.mastery_growth。空数据时给居中提示，不打断页面。
+    """
+    fig = go.Figure()
+    if not rows:
+        return dark(_empty_note(fig, "完成几次作答后，这里会显示掌握度随时间的成长曲线"))
+    import time as _t
+    xs = [_t.strftime("%m-%d", _t.localtime(r["ts"])) for r in rows]
+    fig.add_trace(go.Bar(
+        x=xs, y=[r["mastered"] for r in rows], name="已掌握知识点数", yaxis="y2",
+        marker_color="rgba(34,211,238,0.35)",
+        hovertemplate="<b>%{x}</b>：已掌握 %{y} 个知识点<extra></extra>"))
+    fig.add_trace(go.Scatter(
+        x=xs, y=[r["mean"] for r in rows], name="已接触知识点平均掌握度 θ",
+        mode="lines+markers", line=dict(color="#ffd54a", width=2),
+        hovertemplate="<b>%{x}</b>：平均 θ=%{y:.3f}<extra></extra>"))
+    fig.update_layout(
+        height=400, xaxis_title="日期", yaxis_title="平均掌握度 θ",
+        yaxis=dict(range=[0, 1]),
+        yaxis2=dict(title="已掌握知识点数", overlaying="y", side="right",
+                    showgrid=False, rangemode="tozero",
+                    tickfont=dict(color="#8ea3c0")),
+        title=f"成长曲线（{len(rows)} 天记录）",
+        legend=dict(orientation="h", y=-0.18))
+    return dark(fig)
+
+
 def trend_figure(kg, history: list) -> go.Figure:
     """掌握度快照趋势：每条折线一个知识点"""
     fig = go.Figure()
@@ -284,7 +375,8 @@ def trend_figure(kg, history: list) -> go.Figure:
 
 
 def kg_figure(kg, mastery: dict | None = None, plan=None, current_node=None,
-              category_filter: str = "全部") -> go.Figure:
+              category_filter: str = "全部", highlight: set | None = None,
+              emphasis: str | None = None) -> go.Figure:
     """知识图谱网络图：按类别分组布局，节点颜色=掌握度，分类着色
 
     优化点：
@@ -293,6 +385,7 @@ def kg_figure(kg, mastery: dict | None = None, plan=None, current_node=None,
     3. 边样式区分主路径和普通依赖
     4. 悬停显示更多信息
     5. 支持按类别筛选
+    6. highlight=需要高亮的节点集合（探索视图：先修链/后继），emphasis=被定位的中心节点
     """
     mastery = mastery or {}
     G = nx.DiGraph()
@@ -412,6 +505,28 @@ def kg_figure(kg, mastery: dict | None = None, plan=None, current_node=None,
             hoverinfo="text",
             marker=dict(size=30, symbol="star", color="#22d3ee",
                         line=dict(color="#eaffff", width=2))
+        ))
+
+    # 探索视图高亮：被定位知识点的先修链与后继节点
+    if highlight:
+        hids = [n for n in highlight if n in pos]
+        if hids:
+            fig.add_trace(go.Scatter(
+                x=[pos[n][0] for n in hids], y=[pos[n][1] for n in hids],
+                mode="markers", name="关联节点（先修/后继）",
+                text=[f"{kg.nodes[n].name}：θ={mastery.get(n, 0.0):.2f}" for n in hids],
+                hoverinfo="text",
+                marker=dict(size=30, color="rgba(0,0,0,0)",
+                            line=dict(color="#f472b6", width=3))
+            ))
+    if emphasis and emphasis in pos:
+        fig.add_trace(go.Scatter(
+            x=[pos[emphasis][0]], y=[pos[emphasis][1]],
+            mode="markers", name="定位知识点",
+            text=[f"{kg.nodes[emphasis].name}（难度 {kg.nodes[emphasis].difficulty:.2f}）"],
+            hoverinfo="text",
+            marker=dict(size=38, color="rgba(0,0,0,0)",
+                        line=dict(color="#e879f9", width=4))
         ))
 
     # 类别背景区域

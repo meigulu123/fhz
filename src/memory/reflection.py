@@ -20,7 +20,16 @@ def maybe_reflect(mem, llm, kg, profile, session_id, trigger,
         {"role": "system",
          "content": ("[TPL:reflection]\n你是学习反思助手。基于以下学情统计，输出 JSON："
                      "progress_summary/effective_strategies/plan_adjustments/"
-                     "next_session_preview 四个字段（均为字符串）。")},
+                     "next_session_preview 四个字段（均为字符串），外加一个"
+                     "结构化调整字段 adjust（对象），让下一次会话能直接执行本次反思：\n"
+                     '{"progress_summary": "...", "effective_strategies": "...",'
+                     ' "plan_adjustments": "...", "next_session_preview": "...",'
+                     ' "adjust": {"review_nodes": ["知识点id", "..."],'
+                     ' "pace_hint": "slow|keep|fast", "note": "给学生看的一句调整理由"}}\n'
+                     "要求：review_nodes 只填上表（prereqs）中出现过的知识点 id，"
+                     "按掌握度从低到高最多 2 个；pace_hint 由本次正确率决定（低于 0.5 "
+                     "取 slow，不低于 0.8 取 fast，其余 keep）；note 面向学生、说明"
+                     "为什么这样调整。")},
         {"role": "user",
          "content": f"[trigger={trigger}][stats_json={_json(stats)}]"},
     ]

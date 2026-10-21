@@ -3,6 +3,8 @@
 开发期：控制台输出 INFO 级别及以上
 生产期：文件输出 DEBUG 级别，便于排查问题
 """
+from __future__ import annotations
+
 import logging
 import sys
 from pathlib import Path

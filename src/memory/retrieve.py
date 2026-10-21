@@ -10,6 +10,8 @@ import time
 
 import jieba
 
+from src.student.profile import goal_node_names
+
 IMPORTANT_KINDS = {"quiz", "report", "plan", "scaffold"}
 # 各交互类型的基础重要性权重
 KIND_WEIGHT = {
@@ -141,16 +143,22 @@ def build_context(mem, student_id: str, query: str, last_reflection=None) -> str
 def stats_json(profile, kg, report=None, done_nodes=None) -> dict:
     """画像统计（诊断报告/反思/重规划的 Mock 模板输入 [stats_json=...]）"""
     thetas = list(profile.mastery.values()) or [0.45]
-    weak_ids = sorted((nid for nid, t in profile.mastery.items() if t < 0.4),
-                      key=lambda nid: profile.mastery[nid])[:5]
-    weak = [kg.nodes[nid].name for nid in weak_ids]
+    # weak 优先沿用诊断报告口径（本次摸底答错的节点），无报告时回退低掌握度节点
+    weak = list((report or {}).get("weak") or [])
+    if not weak:
+        weak_ids = sorted((nid for nid, t in profile.mastery.items() if t < 0.4),
+                          key=lambda nid: profile.mastery[nid])[:5]
+        weak = [kg.nodes[nid].name for nid in weak_ids]
     strong_ids = sorted((nid for nid, t in profile.mastery.items() if t >= 0.75),
                         key=lambda nid: profile.mastery[nid])[:5]
     done = done_nodes or []
     # 真正学过的知识点（按完成顺序），供反思/开场白引用，避免引用从未学过的节点
     done_names = [kg.nodes[nid].name for nid in done if nid in kg.nodes]
+    goal_nodes = goal_node_names(profile, kg)
     return {
         "name": profile.name,
+        "goals": list(getattr(profile, "goals", []))[:2],
+        "goal_nodes": goal_nodes[:8],
         "mean_theta": round(sum(thetas) / len(thetas), 3),
         "done": len(done),
         "done_names": done_names,
@@ -162,5 +170,8 @@ def stats_json(profile, kg, report=None, done_nodes=None) -> dict:
         "suggested": (report or {}).get("suggested", ""),
         "covered": (report or {}).get("covered", 0),
         "accuracy": (report or {}).get("accuracy", 0),
+        "correct": (report or {}).get("correct", 0),
+        "wrong": (report or {}).get("wrong", 0),
+        "total_questions": (report or {}).get("total_questions", 0),
         "band": (report or {}).get("band", {}),
     }

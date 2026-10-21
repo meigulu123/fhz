@@ -4,6 +4,8 @@
 仅在页面顶部注入一次 CSS，所有页面共享；不依赖外部字体与 CDN 资源。
 品牌素材：assets/logo_light.png（深色界面用 logo）、assets/mascot.png（吉祥物）。
 """
+from __future__ import annotations
+
 import base64
 from functools import lru_cache
 from pathlib import Path
@@ -66,6 +68,28 @@ _CSS = """
     --blue: #3b82f6;
     --text: #e8eef8;
     --muted: #8ea3c0;
+
+    /* ===== 设计令牌（统一圆角 / 间距 / 字号，避免各页面各写一套数值）===== */
+    --r-sm: 10px;          /* 输入框、标签内小元素 */
+    --r-md: 12px;          /* 按钮、面板、表格 */
+    --r-lg: 16px;          /* 卡片、指标卡 */
+    --sp-1: 6px;
+    --sp-2: 12px;
+    --sp-3: 22px;
+    --sp-4: 34px;
+    --fs-h1: 46px;         /* 首页主标题 */
+    --fs-h2: 30px;         /* 页面标题（st.header） */
+    --fs-h3: 17px;         /* 区块标题（section-title） */
+    --fs-body: 14px;       /* 正文 */
+    --fs-cap: 12.5px;      /* 说明文字 / 图注 */
+    --sidebar-w: 320px;    /* 侧边栏基准宽，窄屏自动收窄 */
+
+    /* ===== 状态语义色（掌握度状态 / 反馈，与主题青蓝分开，避免"全是青色"）===== */
+    --ok: #34d399;         /* 已掌握 */
+    --learn: #60a5fa;      /* 学习中 */
+    --warn: #fbbf24;       /* 待复习 */
+    --idle: #64748b;       /* 未测 / 未开始 */
+    --danger: #f87171;     /* 危险操作：退出登录 / 结束会话 */
 }
 
 /* ===== 底色：深空 + 全息光晕 ===== */
@@ -106,6 +130,9 @@ h1 {
     background-clip: text;
     -webkit-text-fill-color: transparent;
 }
+/* 页面标题 / 区块标题的字号阶梯，保证长页面里层级一眼可辨 */
+h2 { font-size: var(--fs-h2); line-height: 1.3; }
+h3 { font-size: var(--fs-h3); }
 p, label, span, div { color: var(--text); }
 hr { border-color: var(--line); }
 
@@ -114,7 +141,7 @@ section[data-testid="stSidebar"] {
     background: linear-gradient(180deg, rgba(12, 22, 40, 0.92), rgba(8, 14, 28, 0.88));
     border-right: 1px solid var(--line);
     backdrop-filter: blur(14px);
-    flex: 0 0 320px !important;
+    flex: 0 0 var(--sidebar-w) !important;
 }
 section[data-testid="stSidebar"] .stButton > button {
     justify-content: flex-start;
@@ -136,17 +163,70 @@ section[data-testid="stSidebar"] .stButton > button {
 }
 /* 窗口再窄也强制显示左栏（Streamlit 默认 992px 以下折叠；
    700px 以下主区会变 absolute 钉满全屏，拉回文档流保持并排） */
+@media screen and (max-width: 1280px) {
+    :root { --sidebar-w: 264px; }
+    .hero-title { font-size: 38px; }
+    h1 { font-size: var(--fs-h2); }
+}
 @media screen and (max-width: 991.98px) {
     section[data-testid="stSidebar"] {
         display: flex !important;
-        width: 320px !important;
-        min-width: 320px !important;
+        width: var(--sidebar-w) !important;
+        min-width: var(--sidebar-w) !important;
         position: relative !important;
     }
     .stMain, [data-testid="stMain"] {
         position: static !important;
         min-width: 0 !important;
     }
+    .cards-grid { grid-template-columns: repeat(2, 1fr); }
+    .stats-row { gap: 16px; }
+}
+
+/* ===== 手机端（≤700px）：左栏改为覆盖式抽屉，主区独占整屏 =====
+   桌面端左栏是常驻玻璃面板；手机上若仍并排，320px 会吃掉大半个屏幕，
+   因此窄屏改为浮层：由主区右上角的「☰ 打开侧边栏」唤出，收起即完全隐藏。 */
+@media screen and (max-width: 700px) {
+    :root {
+        --sidebar-w: 84vw;
+        --fs-h1: 28px;
+        --fs-h2: 22px;
+        --fs-h3: 15px;
+    }
+    /* 主区不再与左栏并排，占满整屏 */
+    .stMain, [data-testid="stMain"] {
+        position: static !important;
+        min-width: 0 !important;
+        width: 100% !important;
+    }
+    /* 左栏：固定定位浮层，盖在内容之上并自带阴影 */
+    section[data-testid="stSidebar"] {
+        position: fixed !important;
+        top: 0; bottom: 0; left: 0;
+        width: var(--sidebar-w) !important;
+        min-width: var(--sidebar-w) !important;
+        max-width: 84vw !important;
+        z-index: 999990;
+        box-shadow: 0 0 48px rgba(0, 0, 0, .72);
+        overflow-y: auto;
+    }
+    /* 正文左右留白收窄，避免横向溢出与无谓换行 */
+    .block-container, [data-testid="stAppViewBlockContainer"] {
+        padding-left: .75rem !important;
+        padding-right: .75rem !important;
+    }
+    /* 多列一律竖排，单列触控目标够大（含按钮行与左右分栏） */
+    [data-testid="stMain"] [data-testid="stHorizontalBlock"] { flex-wrap: wrap !important; }
+    [data-testid="stMain"] [data-testid="stHorizontalBlock"]
+        > [data-testid="stColumn"], [data-testid="stMain"] .stColumn {
+        flex: 1 1 100% !important;
+        min-width: 100% !important;
+        width: 100% !important;
+    }
+    .cards-grid, .stats-row { grid-template-columns: 1fr; }
+    .stats-row { gap: 10px; }
+    .stButton > button { min-height: 44px; }
+    .chat-banner { flex-wrap: wrap; }
 }
 
 /* ===== 玻璃卡片（st.container(border=True) / st.container(key=...)）===== */
@@ -164,16 +244,17 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
     transition: all 0.25s ease;
 }
 
-/* ===== 按钮：玻璃 + 霓虹 ===== */
+/* ===== 按钮：三级主次分级（主=实心渐变，次=描边幽灵，三级=危险色）===== */
 .stButton > button, .stFormSubmitButton > button {
-    background: rgba(255, 255, 255, 0.05);
+    background: transparent;
     border: 1px solid var(--line);
-    border-radius: 12px;
+    border-radius: var(--r-md);
     color: var(--text);
     font-weight: 500;
     transition: all 0.2s ease;
 }
 .stButton > button:hover, .stFormSubmitButton > button:hover {
+    background: rgba(255, 255, 255, 0.04);
     border-color: var(--line-strong);
     color: #ffffff;
     box-shadow: 0 0 18px rgba(34, 211, 238, 0.28);
@@ -188,6 +269,18 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
 .stButton > button[kind="primary"]:hover, .stFormSubmitButton > button[kind="primary"]:hover {
     box-shadow: 0 8px 30px rgba(34, 211, 238, 0.55);
     color: #04121f;
+}
+/* 三级按钮（type="tertiary"）：危险/破坏性操作专用，与次要按钮明显区分，避免误点 */
+.stButton > button[kind="tertiary"], .stFormSubmitButton > button[kind="tertiary"] {
+    background: transparent;
+    border: 1px solid rgba(248, 113, 113, 0.38);
+    color: #f8a5a5;
+}
+.stButton > button[kind="tertiary"]:hover, .stFormSubmitButton > button[kind="tertiary"]:hover {
+    background: rgba(248, 113, 113, 0.10);
+    border-color: rgba(248, 113, 113, 0.72);
+    color: #ffd7d7;
+    box-shadow: none;
 }
 
 /* ===== 右上角账户入口：胶囊头像按钮 ===== */
@@ -241,18 +334,18 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
 [data-testid="stMetric"] {
     background: var(--panel);
     border: 1px solid var(--line);
-    border-radius: 14px;
+    border-radius: var(--r-lg);
     padding: 14px 16px;
     backdrop-filter: blur(10px);
 }
-[data-testid="stMetricValue"] { color: #7fe6ff; font-weight: 700; }
-[data-testid="stMetricLabel"] { color: var(--muted); }
+[data-testid="stMetricValue"] { color: #7fe6ff; font-weight: 700; font-size: 26px; }
+[data-testid="stMetricLabel"] { color: var(--muted); font-size: var(--fs-cap); }
 
 /* ===== 对话气泡：助手=深色玻璃居左，学生=蓝色半透明居右 ===== */
 [data-testid="stChatMessage"] {
     background: var(--panel);
     border: 1px solid var(--line);
-    border-radius: 14px;
+    border-radius: var(--r-lg);
     backdrop-filter: blur(10px);
     padding: 4px 8px;
     max-width: 86%;
@@ -277,19 +370,19 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
 /* ===== 表格 / 展开面板 / 图表容器 ===== */
 [data-testid="stDataFrame"], [data-testid="stTable"] {
     border: 1px solid var(--line);
-    border-radius: 12px;
+    border-radius: var(--r-md);
     overflow: hidden;
 }
 [data-testid="stExpander"] details {
     background: var(--panel);
     border: 1px solid var(--line);
-    border-radius: 12px;
+    border-radius: var(--r-md);
 }
 [data-testid="stExpander"] summary { color: var(--muted); }
 [data-testid="stAlert"] {
     background: rgba(34, 211, 238, 0.07);
     border: 1px solid var(--line);
-    border-radius: 12px;
+    border-radius: var(--r-md);
 }
 /* 进度条 */
 [data-testid="stProgress"] > div > div > div {
@@ -297,7 +390,7 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
 }
 
 /* ===== 首页组件 ===== */
-.hero-wrap { text-align: center; padding: 34px 0 10px 0; }
+.hero-wrap { text-align: center; padding: var(--sp-4) 0 10px 0; }
 .hero-logo {
     display: inline-block;
     font-size: 13px; letter-spacing: 6px; color: #7fe6ff;
@@ -324,7 +417,7 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
 .gcard {
     background: rgba(255, 255, 255, 0.045);
     border: 1px solid var(--line);
-    border-radius: 16px;
+    border-radius: var(--r-lg);
     padding: 16px 16px 14px 16px;
     backdrop-filter: blur(12px);
     transition: all 0.25s ease;
@@ -337,7 +430,7 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
 }
 .gcard .gicon { color: #22d3ee; margin-bottom: 8px; }
 .gcard .gtitle { font-size: 15px; font-weight: 600; color: #eaf4ff; margin-bottom: 4px; }
-.gcard .gdesc { font-size: 12.5px; color: #8296b3; line-height: 1.5; }
+.gcard .gdesc { font-size: var(--fs-cap); color: #8296b3; line-height: 1.5; }
 
 /* 首页功能卡片标题按钮：去按钮框、标题化，整行可点击 */
 [class*="st-key-card_go_"] .stButton > button {
@@ -364,14 +457,55 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
     margin-right: 4px;
 }
 .section-title {
-    font-size: 17px; font-weight: 600; color: #dbe9fb;
-    margin: 22px 0 6px 0; padding-left: 10px; border-left: 3px solid #22d3ee;
+    font-size: var(--fs-h3); font-weight: 600; color: #dbe9fb;
+    margin: var(--sp-3) 0 var(--sp-1) 0; padding-left: 10px; border-left: 3px solid #22d3ee;
 }
 .pill-row { display: flex; gap: 10px; flex-wrap: wrap; margin: 4px 0 10px 0; }
 .pill {
     border: 1px solid var(--line); border-radius: 999px;
-    padding: 5px 14px; font-size: 12.5px; color: #a9c3e0;
+    padding: 5px 14px; font-size: var(--fs-cap); color: #a9c3e0;
     background: rgba(255, 255, 255, 0.035);
+}
+
+/* ===== 三步上手：步骤卡（首页引导 + 首次弹窗共用）===== */
+.steps-row { display: flex; gap: 12px; flex-wrap: wrap; margin: 8px 0 14px 0; }
+.step-card {
+    flex: 1 1 0; min-width: 190px;
+    background: rgba(255, 255, 255, 0.045);
+    border: 1px solid var(--line); border-radius: var(--r-lg);
+    padding: 14px 16px 13px 16px;
+    backdrop-filter: blur(12px);
+    transition: all 0.25s ease;
+}
+.step-card:hover {
+    border-color: var(--line-strong);
+    box-shadow: 0 8px 22px rgba(34, 211, 238, 0.16);
+}
+.step-card .step-no {
+    display: inline-flex; align-items: center; justify-content: center;
+    width: 26px; height: 26px; border-radius: 50%;
+    background: linear-gradient(135deg, #0ea5e9, #22d3ee);
+    color: #04121f; font-weight: 700; font-size: 13px;
+    margin-bottom: 8px;
+}
+.step-card .step-title { font-size: 14.5px; font-weight: 600; color: #eaf4ff;
+                         margin-bottom: 4px; display: flex; align-items: center; gap: 8px; }
+.step-card .step-desc { font-size: 12.5px; color: #8296b3; line-height: 1.55; }
+.step-card.done { border-color: var(--line-strong); }
+.step-card.done .step-no { background: #22d3ee; }
+.step-card .step-tag {
+    font-size: 11.5px; font-weight: 500; color: #7fe6ff;
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 1px 8px; background: rgba(34, 211, 238, 0.08);
+}
+.onboard-tip { color: var(--muted); font-size: 13.5px; margin: 0 0 2px 0; }
+
+/* ===== 顶部：运行模式徽标（离线演示 / 大模型）===== */
+.mode-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    border: 1px solid var(--line); border-radius: 999px;
+    padding: 3px 12px; font-size: 12px; color: #7fe6ff;
+    background: rgba(34, 211, 238, 0.08); white-space: nowrap;
 }
 
 /* ===== 登录页品牌栏能力卡 ===== */
@@ -381,11 +515,18 @@ div[data-testid="stVerticalBlockBorderWrapper"]:hover {
 }
 [class*="st-key-brand_feat_"] strong { color: #eaf4ff; }
 
-/* ===== 侧边栏：项目名 / 用户信息卡 / 头像 ===== */
-.side-appname {
-    font-size: 16px; font-weight: 700; color: #eaf4ff;
-    margin: 2px 0 12px 0; letter-spacing: 1px;
+/* ===== 侧边栏：品牌区（logo 居中）/ 用户信息卡 / 头像 ===== */
+/* 侧边栏内的 markdown 容器撑满，保证居中基准是整个侧边栏而不是内容自身宽度 */
+[data-testid="stSidebar"] [data-testid="stElementContainer"],
+[data-testid="stSidebar"] [data-testid="stMarkdown"],
+[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] {
+    width: 100%;
 }
+.side-brand {
+    display: flex; flex-direction: column; align-items: center;
+    width: 100%; padding: 4px 0 0 0;
+}
+.side-brand img { display: block; margin: 0 0 6px 0; }
 .avatar-img {
     border-radius: 50%; object-fit: cover;
     border: 2px solid var(--line-strong);

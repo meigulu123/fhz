@@ -82,24 +82,62 @@ class StudentProfile:
 def init_mastery(profile: StudentProfile, kg) -> Dict[str, float]:
     """掌握度初始化（按拓扑顺序逐层计算，保证 prereq_avg 引用已算值）：
 
+    已测节点（对话诊断自述学过）：
     θ_k⁰ = clip(0.25 + 0.40·prior + 0.35·prereq_avg − 0.15·I[∃先修 θ<0.6], 0.05, 0.85)
+    未测节点（既未自述、也无答题证据）：
+    θ_k⁰ = clip(0.12 + 0.30·prereq_avg − 0.5·penalty, 0.05, 0.85)
 
-    prior 由对话诊断得 0/0.5/1.0；未诊断节点取中性先验 0.5。
+    未测节点不再给中性先验 0.5：零基础学生的画像不应被「没人测过的节点」
+    抬到中等水平，否则雷达图与真实答题正确率严重不符。已测节点沿用原公式。
     """
     layers = kg.topological_layers()
     order = sorted(kg.nodes, key=lambda nid: layers[nid])
     for nid in order:
-        prior = profile.prior.get(nid, 0.5)
         prereqs = kg.prereqs_of(nid)
         avg = (sum(profile.mastery[p] for p in prereqs) / len(prereqs)) if prereqs else 0.5
         penalty = 0.15 if any(profile.mastery.get(p, 0.5) < 0.6 for p in prereqs) else 0.0
-        theta = 0.25 + 0.40 * prior + 0.35 * avg - penalty
+        if nid in profile.prior:
+            theta = 0.25 + 0.40 * profile.prior[nid] + 0.35 * avg - penalty
+        else:
+            theta = 0.12 + 0.30 * avg - 0.5 * penalty
         profile.mastery[nid] = min(0.85, max(0.05, theta))
         profile.evidence_count[nid] = 0
     return profile.mastery
 
 
+def is_untested(profile: StudentProfile, nid: str) -> bool:
+    """未测节点：既无答题证据，也不在诊断先验里（画像上按「未测」灰档处理）"""
+    return profile.evidence_count.get(nid, 0) == 0 and nid not in profile.prior
+
+
 BLOOM_LABELS = {1: "记忆", 2: "理解", 3: "应用", 4: "分析", 5: "评价", 6: "创造"}
+
+
+def goal_keyword_set(profile, kg) -> set:
+    """归一化学习目标关键词集合：关键词字符串与知识点 ID 两种写法都接受。
+
+    对话诊断的规则路径给出关键词字符串（与 node.keywords 同域），大模型路径
+    给出知识点 ID；统一成关键词集合后，路径评分与目标命中判断才能一致生效。
+    """
+    out = set()
+    for k in getattr(profile, "goal_keywords", []) or []:
+        node = kg.nodes.get(k)
+        if node is not None:
+            out.update(node.keywords)
+            out.add(node.name)
+        else:
+            out.add(k)
+    return out
+
+
+def goal_node_names(profile, kg, limit: int = 8) -> list:
+    """与学习目标相关的知识点名称（画像统计与对话分析引用）"""
+    raw = list(getattr(profile, "goal_keywords", []) or [])
+    names = [kg.nodes[k].name for k in raw if k in kg.nodes]
+    if not names:
+        kws = set(raw)
+        names = [n.name for n in kg.nodes.values() if set(n.keywords) & kws]
+    return list(dict.fromkeys(names))[:limit]
 
 
 def cognitive_profile(profile: StudentProfile, kg, use_cache: bool = True) -> dict:
